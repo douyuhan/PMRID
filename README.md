@@ -55,13 +55,34 @@ All metadata for images are listed in `benchmark.json`:
 
 ## Pre-trained Models and Benchmark Script
 
-Both [PyTorch](https://pytorch.org/) and [MegEngine](https://megengine.org.cn/) pre-trained models are provided in the `models` directory. 
-The benchmark script is written for models trained with MegEngine. `Python >= 3.6` is required to run the benchmark script.
+Both [PyTorch](https://pytorch.org/) and [MegEngine](https://megengine.org.cn/) pre-trained models are provided in the `models` directory.
+`Python >= 3.6` is required to run the benchmark scripts.
 
-```
-pip install -r requirements.txt
-python3 run_benchmark.py --benchmark /path/to/PMRID/benchmark.json models/mge_pretrained.ckp
-```
+- `run_benchmark_meg.py` runs the MegEngine model (`models/mge_pretrained.ckp`):
+  ```
+  pip install -r requirements.txt
+  python3 run_benchmark_meg.py --benchmark /path/to/PMRID/benchmark.json models/mge_pretrained.ckp
+  ```
+- `run_benchmark_pytorch.py` runs the PyTorch model (`models/torch_pretrained.ckp`) and additionally supports:
+  - all four standard bayer patterns (`RGGB`/`BGGR`/`GRBG`/`GBRG`), read per-sample from `meta.bayer_pattern`
+  - `--save-dir DIR` to dump, per sample, full-image RGB PNG visualizations of the input/prediction/ground-truth (after the same simple ISP used for the PSNR/SSIM metrics) plus the denoised bayer result as a `.raw` file (same `uint16` format as the input, restored to the sample's original `bayer_pattern`)
+  ```
+  pip install -r requirements.txt
+  python3 run_benchmark_pytorch.py --benchmark /path/to/PMRID/benchmark.json models/torch_pretrained.ckp --save-dir /path/to/output
+  ```
+
+## ONNX export & tiled inference
+
+- `export_onnx.py` exports the PyTorch model to a fixed-shape ONNX graph (input/output `(1, 4, H, W)` RGGB planes):
+  ```
+  python3 export_onnx.py models/torch_pretrained.ckp --height 256 --width 256 --dtype fp32
+  ```
+  `--dtype` supports `fp32` (plain export), `fp16` (fp32 export, then the graph is cast to float16 — the model itself is never run in fp16), and `int8` (reserved placeholder; prints why it isn't implemented and exits without writing a file, since int8 needs calibration-based post-training quantization, not a plain cast).
+- `tile_infer.py` runs that fixed-shape ONNX graph over real (arbitrary-size) raw images by splitting each into overlapping tiles matching the graph's `H`/`W`, running each tile through the graph, and stitching the non-overlapping "ownership" region of each tile back together:
+  ```
+  python3 tile_infer.py --onnx models/torch_pretrained_fp32_256x256.onnx --benchmark /path/to/PMRID/benchmark.json --save-dir /path/to/output --compare-full models/torch_pretrained.ckp
+  ```
+  `--margin` controls how many edge pixels of each tile are discarded before stitching (larger = less tile-seam artifact, more compute); `--compare-full` additionally runs the untiled PyTorch model on the same samples and reports the difference, to help tune it.
 
 
 ## Citation

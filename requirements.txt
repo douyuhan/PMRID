@@ -3,3 +3,7 @@ numpy
 opencv-python
 scikit-image
 dataclasses
+torch
+onnx
+onnxruntime
+onnxconverter-common

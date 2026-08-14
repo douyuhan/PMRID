@@ -6,6 +6,8 @@ from typing import Tuple, List
 
 import numpy as np
 
+from utils import RawUtils
+
 
 def read_array(path: Path) -> np.ndarray:
     return np.fromfile(str(path), dtype=np.uint16)
@@ -27,6 +29,7 @@ class RawMeta:
         Tuple[float, float, float],
     ]
     ROIs: List[Tuple[int, int, int, int]]
+    raw_bitWidth: int = 16
 
 
 class BenchmarkLoader:
@@ -73,9 +76,10 @@ class BenchmarkLoader:
                 img_file = self.base_path / img_file
             bayer = read_array(img_file)
             bayer = bayer.reshape(*meta.shape)
-            # Reno 10x outputs BGGR order
-            assert meta.bayer_pattern == 'BGGR'
-            bayer = bayer.astype(np.float32) / 65535
+            assert meta.bayer_pattern in RawUtils.BAYER_PATTERNS, \
+                f'unsupported bayer_pattern: {meta.bayer_pattern!r}'
+            max_val = 2 ** meta.raw_bitWidth - 1
+            bayer = bayer.astype(np.float32) / max_val
             bayers.append(bayer)
 
         input_bayer, gt_bayer = bayers

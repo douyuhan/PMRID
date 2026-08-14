@@ -1,0 +1,11 @@
+test provided benchmark:
+python run_benchmark_pytorch.py --benchmark dataset/benchmark/benchmark.json models/torch_pretrained.ckp --save-dir data_output
+--------------------------------------------------------------------------------------------
+test self data:
+python run_benchmark_pytorch.py --benchmark dataset/test/meta_info.json models/torch_pretrained.ckp --save-dir data_output/test
+--------------------------------------------------------------------------------------------
+export onnx:
+python export_onnx.py models/torch_pretrained.ckp --height 256 --width 256 --dtype fp32
+
+tile infer with onnx:
+python tile_infer.py --onnx models/torch_pretrained_fp32_256x256.onnx --benchmark dataset/test/meta_info.json --save-dir data_output/test_onnx_fp32 --dtype fp32 (--compare-full models/torch_pretrained.ckp)

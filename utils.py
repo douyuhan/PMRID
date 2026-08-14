@@ -5,6 +5,37 @@ import numpy as np
 
 class RawUtils:
 
+    # per-pattern flip needed to bring a 2x2 tile to the canonical RGGB
+    # layout (top-left=R, top-right=G, bottom-left=G, bottom-right=B) that
+    # bayer2rggb/rggb2bayer/bayer2rgb assume. Each entry is (flip_rows, flip_cols).
+    # The mapping is an involution: applying it twice with the same pattern
+    # is the identity, so the same call also converts canonical -> original.
+    _PATTERN_FLIPS = {
+        'RGGB': (False, False),
+        'BGGR': (True, True),
+        'GRBG': (False, True),
+        'GBRG': (True, False),
+    }
+    BAYER_PATTERNS = tuple(_PATTERN_FLIPS)
+
+    @classmethod
+    def to_canonical_rggb(cls, *bayers, pattern):
+        if pattern not in cls._PATTERN_FLIPS:
+            raise ValueError(f'unsupported bayer_pattern: {pattern!r}, expected one of {cls.BAYER_PATTERNS}')
+
+        flip_rows, flip_cols = cls._PATTERN_FLIPS[pattern]
+        res = []
+        for bayer in bayers:
+            if flip_rows:
+                bayer = bayer[::-1, :]
+            if flip_cols:
+                bayer = bayer[:, ::-1]
+            res.append(bayer)
+
+        if len(res) == 1:
+            return res[0]
+        return res
+
     @classmethod
     def bggr2rggb(cls, *bayers):
         res = []
