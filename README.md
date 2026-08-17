@@ -78,11 +78,15 @@ Both [PyTorch](https://pytorch.org/) and [MegEngine](https://megengine.org.cn/) 
   python3 export_onnx.py models/torch_pretrained.ckp --height 256 --width 256 --dtype fp32
   ```
   `--dtype` supports `fp32` (plain export), `fp16` (fp32 export, then the graph is cast to float16 — the model itself is never run in fp16), and `int8` (reserved placeholder; prints why it isn't implemented and exits without writing a file, since int8 needs calibration-based post-training quantization, not a plain cast).
+  `--bake-ksigma` additionally exports the ISO-dependent KSigma noise normalization into the graph itself (as a second `iso` input) instead of leaving it to be applied externally in numpy — by default (flag off) the graph is a bare CNN and the caller (`Denoiser`/`TiledOnnxDenoiser`) applies KSigma before/after it, same as `run_benchmark_pytorch.py`:
+  ```
+  python3 export_onnx.py models/torch_pretrained.ckp --height 256 --width 256 --dtype fp32 --bake-ksigma
+  ```
 - `tile_infer.py` runs that fixed-shape ONNX graph over real (arbitrary-size) raw images by splitting each into overlapping tiles matching the graph's `H`/`W`, running each tile through the graph, and stitching the non-overlapping "ownership" region of each tile back together:
   ```
   python3 tile_infer.py --onnx models/torch_pretrained_fp32_256x256.onnx --benchmark /path/to/PMRID/benchmark.json --save-dir /path/to/output --compare-full models/torch_pretrained.ckp
   ```
-  `--margin` controls how many edge pixels of each tile are discarded before stitching (larger = less tile-seam artifact, more compute); `--compare-full` additionally runs the untiled PyTorch model on the same samples and reports the difference, to help tune it.
+  `--margin` controls how many edge pixels of each tile are discarded before stitching (larger = less tile-seam artifact, more compute); `--compare-full` additionally runs the untiled PyTorch model on the same samples and reports the difference, to help tune it. `--bake-ksigma` must be passed if (and only if) `--onnx` was exported with `export_onnx.py --bake-ksigma` — it makes `tile_infer.py` skip its own external KSigma step and feed each sample's ISO straight into the graph instead; passing it inconsistently with how the model was actually exported is a hard error (checked against the ONNX model's declared input count), not a silent wrong result.
 
 
 ## Citation

@@ -40,7 +40,7 @@ def ownership_bounds(positions, tile, length):
     return bounds
 
 
-def tiled_infer_rggb(sess, input_name, rggb, tile_h, tile_w, margin, np_dtype):
+def tiled_infer_rggb(sess, input_name, rggb, tile_h, tile_w, margin, np_dtype, extra_feed=None):
     """Run a full-size (H, W, 4) RGGB-plane image through a fixed tile_h x tile_w
     ONNX PMRID graph, splitting it into overlapping tiles and stitching the
     non-overlapping "ownership" region of each tile back together.
@@ -55,6 +55,10 @@ def tiled_infer_rggb(sess, input_name, rggb, tile_h, tile_w, margin, np_dtype):
     of the original bayer image in each dimension (bayer2rggb packs each 2x2
     bayer block into one RGGB pixel) -- a 256x256 ONNX tile therefore covers a
     512x512 region of the original raw image.
+
+    `extra_feed`, if given, is merged into every tile's onnxruntime feed dict --
+    used to pass a per-image, per-tile-invariant input (e.g. `iso`, for a
+    --bake-ksigma graph) alongside the tile itself.
     """
     H, W = rggb.shape[:2]
 
@@ -77,7 +81,8 @@ def tiled_infer_rggb(sess, input_name, rggb, tile_h, tile_w, margin, np_dtype):
     for i, y0 in enumerate(ys):
         for j, x0 in enumerate(xs):
             tile = rggb[y0:y0 + tile_h, x0:x0 + tile_w].transpose(2, 0, 1)[np.newaxis].astype(np_dtype)
-            tile_out = sess.run(None, {input_name: tile})[0][0].transpose(1, 2, 0).astype(np.float32)
+            feed = {input_name: tile, **(extra_feed or {})}
+            tile_out = sess.run(None, feed)[0][0].transpose(1, 2, 0).astype(np.float32)
 
             oy0, oy1 = y_bounds[i], y_bounds[i + 1]
             ox0, ox1 = x_bounds[j], x_bounds[j + 1]
@@ -92,9 +97,18 @@ class TiledOnnxDenoiser:
     KSigma normalization / RGGB packing / inp_scale, but the network forward
     pass is replaced by tiled_infer_rggb over a fixed-shape onnxruntime session
     instead of one single-shot PyTorch forward over the whole (32-padded) image.
+
+    If `bake_ksigma` is True, the ONNX graph in `sess` was exported with
+    export_onnx.py --bake-ksigma: KSigma normalize/denormalize (and the
+    inp_scale multiply/divide) live *inside* the graph, so this class must NOT
+    also apply them externally -- doing so would double-normalize. Instead the
+    raw [0,1] RGGB tile is fed straight into the graph, alongside a second
+    `iso` input (the graph's second declared input, by convention named 'iso'
+    -- see export_onnx.py), and the graph's output is already the final
+    denoised RGGB, no un-scaling needed.
     """
 
-    def __init__(self, sess: ort.InferenceSession, margin: int, ksigma: KSigma, dtype: str, inp_scale=256.0):
+    def __init__(self, sess: ort.InferenceSession, margin: int, ksigma: KSigma, dtype: str, inp_scale=256.0, bake_ksigma=False):
         self.sess = sess
         self.input_name = sess.get_inputs()[0].name
         self.tile_h, self.tile_w = sess.get_inputs()[0].shape[2:]
@@ -102,6 +116,9 @@ class TiledOnnxDenoiser:
         self.ksigma = ksigma
         self.np_dtype = NP_DTYPE[dtype]
         self.inp_scale = inp_scale
+        self.bake_ksigma = bake_ksigma
+        if bake_ksigma:
+            self.iso_name = sess.get_inputs()[1].name
 
     def run(self, bayer_01: np.ndarray, iso: float):
         # reflect-pad the RAW bayer mosaic by `margin` RGGB-plane pixels (= 2*margin
@@ -114,15 +131,23 @@ class TiledOnnxDenoiser:
         bayer_01 = np.pad(bayer_01, [(2*pad, 2*pad), (2*pad, 2*pad)], mode='reflect')
 
         rggb = RawUtils.bayer2rggb(bayer_01).clip(0, 1)
-        rggb = self.ksigma(rggb, iso) * self.inp_scale
 
-        pred_rggb, grid_info = tiled_infer_rggb(
-            self.sess, self.input_name, rggb.astype(np.float32),
-            self.tile_h, self.tile_w, self.margin, self.np_dtype,
-        )
+        if self.bake_ksigma:
+            iso_arr = np.array([iso], dtype=self.np_dtype)
+            pred_rggb, grid_info = tiled_infer_rggb(
+                self.sess, self.input_name, rggb.astype(np.float32),
+                self.tile_h, self.tile_w, self.margin, self.np_dtype,
+                extra_feed={self.iso_name: iso_arr},
+            )
+        else:
+            rggb = self.ksigma(rggb, iso) * self.inp_scale
+            pred_rggb, grid_info = tiled_infer_rggb(
+                self.sess, self.input_name, rggb.astype(np.float32),
+                self.tile_h, self.tile_w, self.margin, self.np_dtype,
+            )
+            pred_rggb = pred_rggb / self.inp_scale
+            pred_rggb = self.ksigma(pred_rggb, iso, inverse=True)
 
-        pred_rggb = pred_rggb / self.inp_scale
-        pred_rggb = self.ksigma(pred_rggb, iso, inverse=True)
         pred_rggb = pred_rggb[pad:-pad, pad:-pad]  # crop the edge buffer back off
         return RawUtils.rggb2bayer(pred_rggb), grid_info
 
@@ -151,6 +176,13 @@ def main():
              'path (e.g. models/torch_pretrained.ckp) and report the difference vs the tiled ONNX '
              'result, to help tune --margin',
     )
+    parser.add_argument(
+        '--bake-ksigma', action='store_true',
+        help='must be set if (and only if) the ONNX model in --onnx was exported with '
+             'export_onnx.py --bake-ksigma. When set, tile_infer.py skips its own external KSigma '
+             'step and instead feeds each sample\'s ISO straight into the graph as its second '
+             'input, per tile, since normalize/denormalize already happen inside the graph.',
+    )
     args = parser.parse_args()
 
     if args.dtype == 'int8':
@@ -169,13 +201,24 @@ def main():
             f"--dtype {args.dtype} doesn't match the ONNX model's actual input type "
             f"{onnx_input_type} -- pass the --dtype it was exported with"
         )
+    num_inputs = len(sess.get_inputs())
+    if args.bake_ksigma and num_inputs != 2:
+        raise ValueError(
+            f'--bake-ksigma was passed but the ONNX model in --onnx only declares {num_inputs} '
+            f'input(s) -- it was not exported with export_onnx.py --bake-ksigma'
+        )
+    if not args.bake_ksigma and num_inputs != 1:
+        raise ValueError(
+            f'the ONNX model in --onnx declares {num_inputs} inputs, which looks like it was '
+            f'exported with export_onnx.py --bake-ksigma -- pass --bake-ksigma here too'
+        )
 
     ksigma = KSigma(
         K_coeff=[0.0005995267, 0.00868861],
         B_coeff=[7.11772e-7, 6.514934e-4, 0.11492713],
         anchor=1600,
     )
-    denoiser = TiledOnnxDenoiser(sess, args.margin, ksigma, args.dtype)
+    denoiser = TiledOnnxDenoiser(sess, args.margin, ksigma, args.dtype, bake_ksigma=args.bake_ksigma)
 
     full_denoiser = None
     if args.compare_full is not None:
