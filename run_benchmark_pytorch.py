@@ -10,7 +10,7 @@ import skimage.metrics
 from tqdm import tqdm
 
 from models.net_torch import Network
-from utils import RawUtils
+from utils import RawUtils, round_half_up
 from benchmark import BenchmarkLoader, RawMeta
 
 
@@ -91,12 +91,14 @@ class Denoiser:
 
 
 def save_rgb_png(path: Path, rgb_01: np.ndarray):
-    bgr_uint8 = np.round(rgb_01.clip(0, 1)[..., ::-1] * 255).astype(np.uint8)
+    bgr_uint8 = round_half_up(rgb_01.clip(0, 1)[..., ::-1] * 255).astype(np.uint8)
     cv2.imwrite(str(path), bgr_uint8)
 
 
-def save_bayer_raw(path: Path, bayer_01: np.ndarray, max_val: int):
-    bayer_uint16 = np.round(bayer_01.clip(0, 1) * max_val).astype(np.uint16)
+def save_bayer_raw(path: Path, bayer_01: np.ndarray, bitWidth: int):
+    bayer_uint16 = round_half_up(bayer_01.clip(0, 1) * (2 ** bitWidth))
+    max_val = 2 ** bitWidth - 1
+    bayer_uint16 = bayer_uint16.clip(0, max_val).astype(np.uint16)
     bayer_uint16.tofile(str(path))
 
 
@@ -142,8 +144,7 @@ def run_benchmark(model_path, bm_loader: BenchmarkLoader, save_dir: Path = None)
             # denoised bayer raw, flipped back to the sample's original bayer_pattern
             # and rescaled to the same raw_bitWidth range as the input/gt files
             pred_bayer_orig_pattern = RawUtils.to_canonical_rggb(pred_bayer, pattern=pattern)
-            max_val = 2 ** meta.raw_bitWidth - 1
-            save_bayer_raw(save_dir / f'{meta.name}_pred.raw', pred_bayer_orig_pattern, max_val)
+            save_bayer_raw(save_dir / f'{meta.name}_pred.raw', pred_bayer_orig_pattern, meta.raw_bitWidth)
 
         psnrs = []
         ssims = []

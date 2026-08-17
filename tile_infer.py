@@ -253,8 +253,7 @@ def main():
         save_rgb_png(args.save_dir / f'{meta.name}_gt.png', gt_rgb)
 
         pred_bayer_orig_pattern = RawUtils.to_canonical_rggb(pred_bayer, pattern=pattern)
-        max_val = 2 ** meta.raw_bitWidth - 1
-        save_bayer_raw(args.save_dir / f'{meta.name}_pred.raw', pred_bayer_orig_pattern, max_val)
+        save_bayer_raw(args.save_dir / f'{meta.name}_pred.raw', pred_bayer_orig_pattern, meta.raw_bitWidth)
 
 
 if __name__ == '__main__':
