@@ -7,7 +7,7 @@ import onnxruntime as ort
 from tqdm import tqdm
 
 from utils import RawUtils
-from benchmark import BenchmarkLoader
+from dataset.benchmark import BenchmarkLoader
 from run_benchmark_pytorch import KSigma, Denoiser, save_rgb_png, save_bayer_raw
 
 NP_DTYPE = {'fp32': np.float32, 'fp16': np.float16}

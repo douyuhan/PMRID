@@ -11,7 +11,7 @@ from tqdm import tqdm
 
 from models.net_torch import Network
 from utils import RawUtils, round_half_up
-from benchmark import BenchmarkLoader, RawMeta
+from dataset.benchmark import BenchmarkLoader, RawMeta
 
 
 class KSigma:
