@@ -88,6 +88,26 @@ Both [PyTorch](https://pytorch.org/) and [MegEngine](https://megengine.org.cn/) 
   ```
   `--margin` controls how many edge pixels of each tile are discarded before stitching (larger = less tile-seam artifact, more compute); `--compare-full` additionally runs the untiled PyTorch model on the same samples and reports the difference, to help tune it. `--bake-ksigma` must be passed if (and only if) `--onnx` was exported with `export_onnx.py --bake-ksigma` — it makes `tile_infer.py` skip its own external KSigma step and feed each sample's ISO straight into the graph instead; passing it inconsistently with how the model was actually exported is a hard error (checked against the ONNX model's declared input count), not a silent wrong result.
 
+  `--dtype` is about the ONNX graph's own declared **external** input/output tensor type (what numpy dtype gets fed in/read back), not whether the graph is quantized internally — pass `fp32` for both a plain export and an int8-quantized `quantize_onnx.py` model (its default QDQ format keeps external I/O as float32; only the internal weights/activations are int8), and `fp16` only for an `export_onnx.py --dtype fp16` export (a genuine external type change). `int8` is rejected — no export here ever has a genuinely int8 external interface.
+
+## Post-training quantization (int8)
+
+`quantize_onnx.py` calibrates and quantizes a **fp32** ONNX export (from `export_onnx.py`, without `--bake-ksigma`) down to int8, using real images from a benchmark dataset as calibration data:
+```
+python3 quantize_onnx.py models/torch_pretrained_fp32_256x256.onnx --benchmark /path/to/PMRID/benchmark.json --num-tiles 200
+```
+Calibration images don't need to match the ONNX graph's tile size — they only need to be at least as large as one tile. `quantize_onnx.py` crops a grid of representative tiles out of each real `input.raw` image (never `gt.raw`), already normalized (KSigma + `inp_scale`, using that image's own real ISO) exactly the way the network sees them at inference — this is what makes the calibration meaningful, not just "some float32 arrays". `--per-channel` (recommended, on by default), `--calibrate-method` (`minmax`/`entropy`/`percentile`/`distribution`), and `--quant-format` (`qdq`, the default and most broadly compatible) let you tune accuracy vs. compatibility.
+
+The resulting int8 model still declares `float32` external input/output (standard for onnxruntime's QDQ quantization format), so it runs through `tile_infer.py` unmodified with `--dtype fp32` — but **quantization is never automatically trusted**: re-run `tile_infer.py --compare-full` (or the full PSNR/SSIM benchmark) against the fp32 baseline before using an int8 model for anything real. Passing a model exported with `--bake-ksigma`, or one that isn't fp32, is rejected with a clear error rather than silently mis-quantized. A model validated against onnxruntime's own CPU execution is also not guaranteed to behave identically on a different int8 runtime/accelerator.
+
+## Fully fixed-point inference (tile_infer_hw.py)
+
+`tile_infer.py` always crosses the network's boundary in float32, even with an int8-quantized model. `tile_infer_hw.py` is for the case where PMRID needs to be a drop-in denoise module inside an otherwise fully fixed-point ISP pipeline — the upstream/downstream modules hand off/expect plain integer RAW data (e.g. RAW12) with no floating point at all. It reimplements the RAW bit-depth conversion, KSigma normalize/denormalize, and the final requantize back to RAW pixel data entirely in integer-only fixed-point arithmetic (visualization/`.raw` saving/metrics are left exactly as-is, on float32, same as the other scripts):
+```
+python3 tile_infer_hw.py --onnx models/torch_pretrained_fp32_256x256.onnx --benchmark /path/to/PMRID/benchmark.json --save-dir /path/to/output --bit-module 12 --compare-full models/torch_pretrained.ckp
+```
+`--bit-module` (default 12) is the RAW module interface width; if a sample's `raw_bitWidth` differs, it's converted to/from `--bit-module` via an exact integer bit-shift (always possible since both are plain bit-depths). `--net-bit-int`/`--net-bit-frac` (default 13/18, signed) size the fixed-point format used for the (per-frame, not per-pixel) KSigma coefficients and the value crossing into/out of the network — tune these down once you know your real deployment's ISO range, to match your target hardware's actual register width. The only unavoidable floating-point step is the literal handoff to onnxruntime (its graph still declares `float32` I/O regardless — see `tile_infer.py`'s `--dtype`), which is a lossless container conversion, not new computation. `--compare-full` verifies the result against the untiled float32 PyTorch reference the same way `tile_infer.py` does.
+
 
 ## Citation
 ```

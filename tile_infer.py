@@ -10,6 +10,27 @@ from utils import RawUtils
 from dataset.benchmark import BenchmarkLoader
 from run_benchmark_pytorch import KSigma, Denoiser, save_rgb_png, save_bayer_raw
 
+# --dtype describes the ONNX graph's own declared EXTERNAL input/output tensor type --
+# i.e. what numpy dtype must be fed in / comes back out -- not whether the graph is
+# quantized internally. These two things are independent:
+#
+# - fp32 (default): the graph's 'input'/'output' are declared tensor(float). This covers
+#   BOTH a plain export_onnx.py export AND an int8-quantized model from quantize_onnx.py:
+#   quantize_onnx.py's default QuantFormat.QDQ wraps only the *internal* weights/activations
+#   in QuantizeLinear/DequantizeLinear pairs (confirmed empirically -- sess.get_inputs()[0].type
+#   is still 'tensor(float)' after quantization) and deliberately leaves the graph's outer
+#   boundary as float32, so an int8-quantized model is fed/read exactly like a plain fp32
+#   one from this script's point of view. Use --dtype fp32 for both.
+# - fp16: export_onnx.py --dtype fp16 does a *graph-level* cast (onnxconverter_common,
+#   keep_io_types=False) that changes the declared external tensor type itself to
+#   float16, not just internal weights -- so this is the one case where the fed/read
+#   numpy dtype genuinely has to change.
+# - int8: NOT a real choice for anything this repo currently produces. No export path
+#   here ever declares a genuinely int8 external input/output (quantize_onnx.py's QDQ
+#   int8 models still declare tensor(float), same as fp32 -- see above), so there's no
+#   dtype to actually feed. Kept as a rejected CLI choice (see main()) only to mirror
+#   export_onnx.py's --dtype options and fail loudly instead of silently mishandling a
+#   model this script doesn't know how to talk to, should one ever show up.
 NP_DTYPE = {'fp32': np.float32, 'fp16': np.float16}
 ONNX_TYPE = {'fp32': 'tensor(float)', 'fp16': 'tensor(float16)'}
 
@@ -167,8 +188,14 @@ def main():
     )
     parser.add_argument(
         '--dtype', type=str, default='fp32', choices=['fp32', 'fp16', 'int8'],
-        help='must match the --dtype the ONNX model in --onnx was actually exported with '
-             '(export_onnx.py). int8 is not supported here yet (see export_onnx.py --dtype for why).',
+        help="the ONNX graph's own declared EXTERNAL input/output tensor dtype (what numpy "
+             "dtype must be fed in/read back), NOT whether it's quantized internally -- pass "
+             "'fp32' for both a plain export_onnx.py export AND an int8-quantized "
+             "quantize_onnx.py model (its QDQ format keeps external I/O as float32; see the "
+             "NP_DTYPE/ONNX_TYPE comment above main() for why). 'fp16' is for an "
+             "export_onnx.py --dtype fp16 export specifically (a real graph-level type "
+             "change). 'int8' is rejected -- no export in this repo ever declares a "
+             "genuinely int8 external input/output.",
     )
     parser.add_argument(
         '--compare-full', type=Path, default=None, metavar='TORCH_MODEL',
@@ -186,7 +213,12 @@ def main():
     args = parser.parse_args()
 
     if args.dtype == 'int8':
-        raise NotImplementedError('--dtype int8 is not implemented (see export_onnx.py --dtype for why)')
+        raise NotImplementedError(
+            "--dtype int8 is rejected: no ONNX export this repo produces ever declares a "
+            "genuinely int8 external input/output -- an int8-quantized quantize_onnx.py model "
+            "still declares tensor(float) I/O (QDQ format), so pass --dtype fp32 for it too "
+            "(see the NP_DTYPE/ONNX_TYPE comment above main() for the full explanation)."
+        )
 
     sess = ort.InferenceSession(str(args.onnx), providers=['CPUExecutionProvider'])
     tile_h, tile_w = sess.get_inputs()[0].shape[2:]
