@@ -295,7 +295,8 @@ def main():
         input_bayer, gt_bayer = RawUtils.to_canonical_rggb(input_bayer, gt_bayer, pattern=pattern)
 
         # Recover the exact original raw_bitWidth integer from BenchmarkLoader's
-        # float32 [0,1] normalization (which divides by 2**raw_bitWidth - 1) --
+        # float32 [0,1] normalization (which divides by 2**raw_bitWidth, the
+        # same shift-friendly convention used throughout this script) --
         # lossless: float32's 24-bit mantissa comfortably exceeds any realistic
         # raw_bitWidth (12-16 bits), so this round-trip introduces no error
         # beyond what round_half_up already accounts for. This is specifically
@@ -303,8 +304,7 @@ def main():
         # the (1<<bit_frac) fixed-point convention used everywhere else in this
         # script -- the genuinely fixed-point part of this pipeline starts once
         # we have this exact integer back, at the rescale_bitdepth call below.
-        raw_max_val = 2 ** meta.raw_bitWidth - 1
-        input_raw_int = round_half_up(input_bayer.astype(np.float64) * raw_max_val).astype(np.int64)
+        input_raw_int = round_half_up(input_bayer.astype(np.float64) * (2 ** meta.raw_bitWidth)).astype(np.int64)
 
         module_int = rescale_bitdepth(input_raw_int, meta.raw_bitWidth, args.bit_module)
 

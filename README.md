@@ -71,6 +71,10 @@ Both [PyTorch](https://pytorch.org/) and [MegEngine](https://megengine.org.cn/) 
   python3 run_benchmark_pytorch.py --benchmark /path/to/PMRID/benchmark.json models/torch_pretrained.ckp --save-dir /path/to/output
   ```
 
+### Test notes
+- PMRID can replace GIC, 2DNR, 3DNR, YNR, based on IMX415 dataset.
+
+
 ## ONNX export & tiled inference
 
 - `export_onnx.py` exports the PyTorch model to a fixed-shape ONNX graph (input/output `(1, 4, H, W)` RGGB planes):
@@ -107,6 +111,8 @@ The resulting int8 model still declares `float32` external input/output (standar
 python3 tile_infer_hw.py --onnx models/torch_pretrained_fp32_256x256.onnx --benchmark /path/to/PMRID/benchmark.json --save-dir /path/to/output --bit-module 12 --compare-full models/torch_pretrained.ckp
 ```
 `--bit-module` (default 12) is the RAW module interface width; if a sample's `raw_bitWidth` differs, it's converted to/from `--bit-module` via an exact integer bit-shift (always possible since both are plain bit-depths). `--net-bit-int`/`--net-bit-frac` (default 13/18, signed) size the fixed-point format used for the (per-frame, not per-pixel) KSigma coefficients and the value crossing into/out of the network — tune these down once you know your real deployment's ISO range, to match your target hardware's actual register width. The only unavoidable floating-point step is the literal handoff to onnxruntime (its graph still declares `float32` I/O regardless — see `tile_infer.py`'s `--dtype`), which is a lossless container conversion, not new computation. `--compare-full` verifies the result against the untiled float32 PyTorch reference the same way `tile_infer.py` does.
+
+Every int↔float conversion of a fixed-width pixel value across this repo (loading `.raw` files, `tile_infer_hw.py`'s own fixed-point math, etc.) normalizes via `2**bit` — a bit-shift, matching real hardware — not `2**bit - 1`.
 
 
 ## Citation

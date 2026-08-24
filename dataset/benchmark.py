@@ -78,8 +78,10 @@ class BenchmarkLoader:
             bayer = bayer.reshape(*meta.shape)
             assert meta.bayer_pattern in RawUtils.BAYER_PATTERNS, \
                 f'unsupported bayer_pattern: {meta.bayer_pattern!r}'
-            max_val = 2 ** meta.raw_bitWidth - 1
-            bayer = bayer.astype(np.float32) / max_val
+            # hardware normalizes via a bit-shift (divide by 2**bit), not by the
+            # true max representable value (2**bit - 1) -- see round_half_up's
+            # docstring in utils.py for the matching quantize-side convention
+            bayer = bayer.astype(np.float32) / (2 ** meta.raw_bitWidth)
             bayers.append(bayer)
 
         input_bayer, gt_bayer = bayers

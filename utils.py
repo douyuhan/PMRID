@@ -10,7 +10,7 @@ def round_half_up(x):
     nearest even integer roughly half the time. That's a real bias for
     fixed-point quantization here: pixel values land on an exact .5 boundary
     often enough (e.g. whenever the upstream float32 math produces a value a
-    clean fraction of 1/65535 etc.) that banker's rounding measurably skews
+    clean fraction of 1/65536 etc.) that banker's rounding measurably skews
     quantized output versus true rounding.
     """
     return np.sign(x) * np.floor(np.abs(x) + 0.5)
@@ -100,8 +100,12 @@ class RawUtils:
             bayer = cls.rggb2bayer(
                 (cls.bayer2rggb(bayer_01) * wb_gain).clip(0, 1)
             ).astype(np.float32)
-            bayer = round_half_up(np.ascontiguousarray(bayer) * 65535).clip(0, 65535).astype(np.uint16)
-            rgb = cv2.cvtColor(bayer, cv2.COLOR_BAYER_BG2RGB_EA).astype(np.float32) / 65535
+            # quantize/dequantize this fixed 16-bit intermediate the same
+            # shift-friendly way as everywhere else: multiply/divide by 2**16,
+            # not by the true max value 2**16 - 1 (still the clip bound, since
+            # that's the largest value a uint16 container can actually hold)
+            bayer = round_half_up(np.ascontiguousarray(bayer) * 65536).clip(0, 65535).astype(np.uint16)
+            rgb = cv2.cvtColor(bayer, cv2.COLOR_BAYER_BG2RGB_EA).astype(np.float32) / 65536
             rgb = rgb.dot(np.array(CCM).T).clip(0, 1)
             rgb = rgb ** (1/gamma)
             res.append(rgb.astype(np.float32))
