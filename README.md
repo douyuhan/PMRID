@@ -75,6 +75,17 @@ Both [PyTorch](https://pytorch.org/) and [MegEngine](https://megengine.org.cn/) 
 - PMRID can replace GIC, 2DNR, 3DNR, YNR, based on IMX415 dataset.
 
 
+## Training
+
+`train_pytorch.py` trains `models/net_torch.py::Network` (**the recommended path** — see below for the MegEngine original this was ported from):
+```
+python3 train_pytorch.py --data-dir /path/to/clean_images --data-aug-config /path/to/data_aug_config.json --ckp-dir ./checkpoints
+```
+Unlike the benchmark dataset (real paired noisy/gt captures), training data is just **clean** (well-exposed, low-noise) raw images — noise is synthesized on the fly each batch (Poisson shot noise + Gaussian read noise, then KSigma-normalized to an anchor ISO) rather than captured. `--data-dir` must contain an `index.json` listing each image's `path`/`width`/`height`/`black_level`/`white_level`/`bayer_pattern`/`g_mean_01`; `--data-aug-config` is a JSON file supplying the sensor's noise model (`K`/`B` polynomial coefficients, `value_scale`) and augmentation ranges (`iso_range`, `target_brighness_range`, `output_shape`) — **this is also where the `KSigma` constants used by the benchmark/ONNX/quantization scripts above should be calibrated from**, so training and inference stay consistent for a given sensor. Checkpoints save to `--ckp-dir/epoch_N.ckp`, `torch.load`-compatible with every other script in this repo that takes a `.ckp` path.
+
+`train_meg.py`/`dataset/training.py` is the original MegEngine version this was ported from (added upstream after this repo's initial pure-inference release); kept for reference, but MegEngine has no installable wheel on Windows, so it isn't runnable here.
+
+
 ## ONNX export & tiled inference
 
 - `export_onnx.py` exports the PyTorch model to a fixed-shape ONNX graph (input/output `(1, 4, H, W)` RGGB planes):

@@ -13,7 +13,7 @@ from megfile import SmartPath, smart_load_from
 from megengine.data.dataset import Dataset
 
 
-class BayerPattern(Enum, str):
+class BayerPattern(str, Enum):
     RGGB = "RGGB"
     BGGR = "BGGR"
     GRBG = "GRBG"
@@ -63,7 +63,7 @@ class CleanRawImages(Dataset):
             assert index_file is None
             index_file = data_dir / "index.json"
 
-        self.opts = DataAugOptions
+        self.opts = opts
         self.filelist: List[RawImageItem] = []
         with index_file.open() as f:
             items = [RawImageItem.parse_obj(x) for x in json.load(f)]
@@ -120,8 +120,10 @@ class CleanRawImages(Dataset):
 
         raw01 = (rawimg - item.black_level) / (item.white_level - item.black_level)
         H, W = raw01.shape
-        # pixel shuffle to RGGB image
+        # pixel shuffle to RGGB image, then channel-first (4, H, W) for the network's
+        # NCHW convention -- Network's first conv expects channel dim at axis 1
         rggb01 = raw01.reshape(H//2, 2, W//2, 2).transpose(0, 2, 1, 3).reshape(H//2, W//2, 4)
+        rggb01 = np.ascontiguousarray(rggb01.transpose(2, 0, 1))
         return rggb01, np.array(item.g_mean_01)
 
 
@@ -165,13 +167,16 @@ class DataAug:
         batch_gt = batch_gt * cvt_k + cvt_b
         return (batch_imgs, batch_gt, cvt_k)
 
-    def k_sigma(self, iso: float) -> Tuple[float, float]:
+    def k_sigma(self, iso: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         k, sigma = self.noise_func(iso, value_scale=self.opts.camera_value_scale)
         k_a, sigma_a = self.noise_func(self.opts.anchor_iso, value_scale=self.opts.camera_value_scale)
 
         cvt_k = k_a / k
         cvt_b = (sigma / (k ** 2) - sigma_a / (k_a ** 2)) * k_a
 
+        # reshape to broadcast against the (N, 4, H, W) batch, same as add_noise's k/b
+        cvt_k = cvt_k.reshape(-1, 1, 1, 1)
+        cvt_b = cvt_b.reshape(-1, 1, 1, 1)
         return cvt_k, cvt_b
 
     def brightness_aug(self, img_batch: mge.Tensor, orig_gmean: List[float]) -> mge.Tensor:
@@ -181,7 +186,7 @@ class DataAug:
         s = np.clip(btarget / orig_gmean, 0.01, 1.0)
         return img_batch * s.reshape(-1, 1, 1, 1)
 
-    def add_noise(self, img: mge.Tensor) -> Tuple[mge.Tensor, float]:
+    def add_noise(self, img: mge.Tensor) -> Tuple[mge.Tensor, np.ndarray]:
         """
         Args:
             - img: [-black, camera_value_scale]
@@ -202,4 +207,4 @@ class DataAug:
         noisy = shot_noisy + read_noisy
         noisy = F.round(noisy)
 
-        return noisy
+        return noisy, isos

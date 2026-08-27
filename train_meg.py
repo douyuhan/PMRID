@@ -59,8 +59,6 @@ def main():
 
         if epoch < 3000:
             f = 1 - step / (M*3000)
-        elif epoch < 3000:
-            f = 0.1
         elif epoch < 5000:
             f = 0.2
         else:
