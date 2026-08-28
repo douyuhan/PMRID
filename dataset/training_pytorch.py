@@ -22,6 +22,17 @@ dataset/training.py and this file, so the two stay in sync:
     the (N, H, W, 4)-shaped batch with a bare `* cvt_k` -- with no reshape, that only
     broadcasts correctly by accident (would require N == 4). Fixed by reshaping
     cvt_k/cvt_b to (-1, 1, 1, 1), the same way add_noise already reshapes k/b.
+  - DataAug.transform ended right after `* cvt_k + cvt_b`, leaving the network input in
+    raw `camera_value_scale`-scaled units. Inference (run_benchmark_pytorch.py) instead
+    ends KSigma normalization with `/ V` (KSigma.__call__) followed by a separate
+    `* inp_scale` (Denoiser.run) before the network ever sees the data -- a step this
+    training pipeline had no equivalent of at all. Confirmed numerically (fixed camera
+    parameters, varying iso) that this made every training-time network input exactly
+    `camera_value_scale / inp_scale` larger in magnitude than what the same model sees at
+    inference (~3.75x for the Reno 10x defaults, 959/256, constant across iso). Fixed by
+    adding an `inp_scale` field to DataAugOptions (default 256.0, matching
+    export_onnx.py/run_benchmark_pytorch.py's own default) and applying the matching
+    `/ camera_value_scale * inp_scale` step at the end of DataAug.transform.
 """
 import json
 import math
@@ -68,6 +79,7 @@ class DataAugOptions:
     anchor_iso: float = 1600.0
     output_shape: Tuple[int, int] = (512, 512)   # 512x512x4
     target_brighness_range: Tuple[float, float] = (0.02, 0.5)
+    inp_scale: float = 256.0
 
     @staticmethod
     def parse_file(path) -> "DataAugOptions":
@@ -207,6 +219,15 @@ class DataAug:
 
         batch_imgs = batch_imgs * cvt_k + cvt_b
         batch_gt = batch_gt * cvt_k + cvt_b
+
+        # Match inference's final normalization exactly (run_benchmark_pytorch.py's
+        # KSigma.__call__ ends with `/ V`, then Denoiser.run separately multiplies by
+        # `inp_scale` before feeding the network) -- without this, the network here was
+        # trained on inputs a fixed `camera_value_scale / inp_scale` (~3.75x for the
+        # Reno 10x defaults) larger in magnitude than what it actually sees at inference.
+        batch_imgs = batch_imgs / self.opts.camera_value_scale * self.opts.inp_scale
+        batch_gt = batch_gt / self.opts.camera_value_scale * self.opts.inp_scale
+
         return batch_imgs, batch_gt, cvt_k
 
     def k_sigma(self, iso: np.ndarray) -> Tuple[torch.Tensor, torch.Tensor]:

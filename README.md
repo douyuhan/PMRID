@@ -79,12 +79,39 @@ Both [PyTorch](https://pytorch.org/) and [MegEngine](https://megengine.org.cn/) 
 
 `train_pytorch.py` trains `models/net_torch.py::Network` (**the recommended path** — see below for the MegEngine original this was ported from):
 ```
-python3 train_pytorch.py --data-dir /path/to/clean_images --data-aug-config /path/to/data_aug_config.json --ckp-dir ./checkpoints
+python3 train_pytorch.py --data-dir /path/to/clean_images --ckp-dir ./checkpoints
 ```
-Unlike the benchmark dataset (real paired noisy/gt captures), training data is just **clean** (well-exposed, low-noise) raw images — noise is synthesized on the fly each batch (Poisson shot noise + Gaussian read noise, then KSigma-normalized to an anchor ISO) rather than captured. `--data-dir` must contain an `index.json` listing each image's `path`/`width`/`height`/`black_level`/`white_level`/`bayer_pattern`/`g_mean_01`; `--data-aug-config` is a JSON file supplying the sensor's noise model (`K`/`B` polynomial coefficients, `value_scale`) and augmentation ranges (`iso_range`, `target_brighness_range`, `output_shape`) — **this is also where the `KSigma` constants used by the benchmark/ONNX/quantization scripts above should be calibrated from**, so training and inference stay consistent for a given sensor. Checkpoints save to `--ckp-dir/epoch_N.ckp`, `torch.load`-compatible with every other script in this repo that takes a `.ckp` path.
+Unlike the benchmark dataset (real paired noisy/gt captures), training data is just **clean** (well-exposed, low-noise) raw images — noise is synthesized on the fly each batch (Poisson shot noise + Gaussian read noise, then KSigma-normalized to an anchor ISO, then rescaled to the network's actual input magnitude) rather than captured. `--data-dir` must contain an `index.json` listing each image's `path`/`width`/`height`/`black_level`/`white_level`/`bayer_pattern`/`g_mean_01`.
 
-`train_meg.py`/`dataset/training.py` is the original MegEngine version this was ported from (added upstream after this repo's initial pure-inference release); kept for reference, but MegEngine has no installable wheel on Windows, so it isn't runnable here.
+The data-augmentation/KSigma calibration is a set of CLI options (not a JSON config file), defaulting to the Reno 10x calibration — this repo's only actual target sensor, matching `run_benchmark_pytorch.py`'s `KSigma(...)` exactly:
 
+| option | meaning | default |
+|---|---|---|
+| `--k-coeff` / `--b-coeff` | sensor noise model polynomial coefficients (same calibration as `run_benchmark_pytorch.py`'s `KSigma(K_coeff=..., B_coeff=...)`) | Reno 10x calibration |
+| `--noise-value-scale` | the scale `--k-coeff`/`--b-coeff` were calibrated at | `959.0` |
+| `--camera-value-scale` | scale applied to the clean `[0,1]` image before noise synthesis — same role as `KSigma`'s `V` at inference | `959.0` |
+| `--anchor-iso` | the ISO noise level everything gets normalized to (same as `KSigma`'s `anchor`) | `1600.0` |
+| `--inp-scale` | final rescale before the network sees the data — must match whatever `inp_scale` the inference side uses | `256.0` (same as `run_benchmark_pytorch.py`'s `Denoiser`/`export_onnx.py`) |
+| `--iso-range` | random ISO sampled per image per batch to synthesize noise at | `800 6400` |
+| `--output-shape` | random-crop size in raw bayer-pixel space (network input ends up half that per side, 4x channels) | `512 512` |
+| `--target-brightness-range` | brightness-darkening augmentation target range (never brightens) | `0.02 0.5` |
+
+The first five are **sensor-calibration constants** — this is also where the `KSigma` constants used by the benchmark/ONNX/quantization scripts above should be calibrated from, so training and inference stay consistent for a given sensor; for a fixed target sensor these can just stay at their Reno 10x defaults. `--iso-range`/`--output-shape`/`--target-brightness-range` are **training-strategy choices** unrelated to sensor calibration — override them per training run without touching the sensor constants (e.g. widen `--iso-range` to cover ISOs beyond the benchmark set). Checkpoints save to `--ckp-dir/epoch_N.ckp`, `torch.load`-compatible with every other script in this repo that takes a `.ckp` path.
+
+`train_meg.py`/`dataset/training.py` is the original MegEngine version this was ported from (added upstream after this repo's initial pure-inference release); kept for reference, but MegEngine has no installable wheel on Windows, so it isn't runnable here, and per the user it's intentionally left un-synced with fixes (like the `inp_scale` normalization step above) that were only found/verified by actually running the PyTorch side.
+
+### QAT (quantization-aware training) fine-tuning
+
+`train_qat_pytorch.py` fine-tunes an existing fp32 checkpoint with fake-quantization inserted (`prepare_qat_fx`, per-channel symmetric int8 weights — matching `quantize_onnx.py`'s own `--per-channel` default), so the exported weights are already shaped to tolerate that quantization scheme rather than only calibrating scale/zero-point after the fact. It shares the same data-augmentation CLI options as `train_pytorch.py` above (same Reno 10x defaults):
+```
+python3 train_qat_pytorch.py --init-ckp models/torch_pretrained.ckp --data-dir /path/to/clean_images --ckp-dir ./checkpoints_qat --num-epoch 10
+```
+Meant to be a brief fine-tune (small `--learning-rate`, few `--num-epoch`) adapting already-converged weights, not training from scratch. It never calls PyTorch's own `convert_fx()` — that raises `Per Channel Quantization is currently disabled for transposed conv`, and every decoder stage here uses a `ConvTranspose2d` for its 2x upsample — so the saved checkpoint is a plain fp32 `.ckp`, meant to be fed through the existing `export_onnx.py` → `quantize_onnx.py` pipeline exactly like `models/torch_pretrained.ckp`, just calibrate against `dataset/calibrate/calibrate.json` (a curated subset of `dataset/benchmark/`, same schema) rather than the full benchmark set:
+```
+python3 export_onnx.py checkpoints_qat/epoch_9.ckp --dtype fp32 --output qat_fp32.onnx
+python3 quantize_onnx.py qat_fp32.onnx --benchmark dataset/calibrate/calibrate.json --num-tiles 200
+```
+This has only been verified as a plumbing check (trains without error, checkpoint loads cleanly, re-exports/re-quantizes successfully) — whether it actually improves int8 quality on real data is still untested; see CLAUDE.md.
 
 ## ONNX export & tiled inference
 

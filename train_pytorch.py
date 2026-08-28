@@ -6,8 +6,14 @@ just swapping MegEngine's GradManager/optimizer/DataLoader for PyTorch's autogra
 DataLoader. Uses models/net_torch.py::Network (the PyTorch port of models/net_mge.py::Network)
 and dataset/training_pytorch.py (the PyTorch port of dataset/training.py) -- see that file's
 docstring for the handful of bugs found and fixed while porting (missing channel permute,
-missing cvt_k/cvt_b broadcast reshape, CleanRawImages.__init__ dropping its own `opts` arg).
+missing cvt_k/cvt_b broadcast reshape, CleanRawImages.__init__ dropping its own `opts` arg,
+the missing final inp_scale rescale in DataAug.transform).
 The dead LR-schedule branch already removed from train_meg.py is not re-added here either.
+
+DataAugOptions is built from individual CLI options (add_data_aug_args/build_data_aug_options
+below) rather than a `--data-aug-config` JSON file -- defaults are the Reno 10x calibration,
+matching run_benchmark_pytorch.py's KSigma(...) exactly, since that's this repo's only actual
+target sensor. train_qat_pytorch.py reuses these same two functions.
 """
 import argparse
 from pathlib import Path
@@ -18,7 +24,67 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from models.net_torch import Network
-from dataset.training_pytorch import CleanRawImages, DataAug, DataAugOptions
+from dataset.training_pytorch import CleanRawImages, DataAug, DataAugOptions, NoiseProfile
+
+# Reno 10x KSigma calibration, matching run_benchmark_pytorch.py's KSigma(...) construction
+# exactly -- the default target sensor for every script in this repo.
+RENO10X_K_COEFF = (0.0005995267, 0.00868861)
+RENO10X_B_COEFF = (7.11772e-7, 6.514934e-4, 0.11492713)
+RENO10X_ANCHOR_ISO = 1600.0
+RENO10X_VALUE_SCALE = 959.0  # camera_value_scale / noise_profile.value_scale / KSigma.V
+RENO10X_INP_SCALE = 256.0    # matches run_benchmark_pytorch.py's Denoiser/export_onnx.py default
+
+
+def add_data_aug_args(parser: argparse.ArgumentParser) -> argparse._ArgumentGroup:
+    """CLI options for every dataset/training_pytorch.py::DataAugOptions field. Defaults are
+    the Reno 10x calibration (matching run_benchmark_pytorch.py's KSigma) for --k-coeff/
+    --b-coeff/--noise-value-scale/--camera-value-scale/--anchor-iso/--inp-scale -- these six
+    are sensor-calibration constants, fixed for a given sensor, not training choices. The
+    other three (--iso-range/--output-shape/--target-brightness-range) are pure training
+    strategy knobs unrelated to sensor calibration -- --iso-range in particular is the cheap
+    lever for widening high-ISO coverage discussed for QAT fine-tuning, so it stays a
+    separate, easily-overridden option rather than being folded into the sensor constants.
+    """
+    group = parser.add_argument_group('data augmentation / KSigma calibration')
+    group.add_argument('--k-coeff', nargs=2, type=float, default=list(RENO10X_K_COEFF),
+                        help='noise model K(iso) polynomial coefficients')
+    group.add_argument('--b-coeff', nargs=3, type=float, default=list(RENO10X_B_COEFF),
+                        help='noise model B(iso)/Sigma(iso) polynomial coefficients')
+    group.add_argument('--noise-value-scale', type=float, default=RENO10X_VALUE_SCALE,
+                        help='the scale --k-coeff/--b-coeff were calibrated at')
+    group.add_argument('--camera-value-scale', type=float, default=RENO10X_VALUE_SCALE,
+                        help="scale applied to the clean [0,1] image before noise synthesis "
+                             "-- same role as inference's KSigma.V")
+    group.add_argument('--anchor-iso', type=float, default=RENO10X_ANCHOR_ISO,
+                        help="ISO noise level everything is normalized to -- same as "
+                             "inference's KSigma(anchor=...)")
+    group.add_argument('--inp-scale', type=float, default=RENO10X_INP_SCALE,
+                        help="final rescale before the network sees the data -- must match "
+                             "the inference side's Denoiser/export_onnx.py inp_scale")
+    
+    group.add_argument('--iso-range', nargs=2, type=float, default=[800.0, 25600.0],
+                        help='ISO range randomly sampled per training sample to synthesize '
+                             'noise at')
+    group.add_argument('--output-shape', nargs=2, type=int, default=[512, 512],
+                        help='random-crop size in raw bayer-pixel space (network input ends '
+                             'up half that per side, 4x channels)')
+    group.add_argument('--target-brightness-range', nargs=2, type=float, default=[0.02, 0.5],
+                        help='brightness-darkening augmentation target range (never brightens)')
+    return group
+
+
+def build_data_aug_options(args: argparse.Namespace) -> DataAugOptions:
+    return DataAugOptions(
+        noise_profile=NoiseProfile(
+            K=tuple(args.k_coeff), B=tuple(args.b_coeff), value_scale=args.noise_value_scale,
+        ),
+        iso_range=tuple(args.iso_range),
+        camera_value_scale=args.camera_value_scale,
+        anchor_iso=args.anchor_iso,
+        output_shape=tuple(args.output_shape),
+        target_brighness_range=tuple(args.target_brightness_range),
+        inp_scale=args.inp_scale,
+    )
 
 
 def get_loss_l1(pred: torch.Tensor, label: torch.Tensor, norm_k: torch.Tensor) -> torch.Tensor:
@@ -30,8 +96,8 @@ def get_loss_l1(pred: torch.Tensor, label: torch.Tensor, norm_k: torch.Tensor) -
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--data-aug-config', type=Path, required=True)
     parser.add_argument('--data-dir', type=Path, required=True)
+    add_data_aug_args(parser)
     parser.add_argument('--batch-size', default=1, type=int)
     parser.add_argument('--ckp-dir', default=Path('./checkpoints'), type=Path)
     parser.add_argument('--learning-rate', dest='lr', default=1e-3, type=float)
@@ -48,7 +114,7 @@ def main():
     # Create optimizer
     optimizer = optim.Adam(net.parameters(), lr=args.lr)
 
-    aug_opts = DataAugOptions.parse_file(args.data_aug_config)
+    aug_opts = build_data_aug_options(args)
     train_aug = DataAug(aug_opts, device=device)
     train_ds = CleanRawImages(data_dir=args.data_dir, opts=aug_opts)
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, drop_last=True)
