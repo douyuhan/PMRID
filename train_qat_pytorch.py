@@ -34,6 +34,7 @@ the Reno 10x calibration, matching this repo's only actual target sensor.
 import argparse
 from pathlib import Path
 
+import numpy as np
 import torch
 import torch.optim as optim
 from torch.ao.quantization import QConfigMapping, get_default_qat_qconfig
@@ -66,8 +67,8 @@ def main():
     add_data_aug_args(parser)
     parser.add_argument('--init-ckp', type=Path, default=Path('models/torch_pretrained.ckp'),
                          help='fp32 checkpoint to start QAT fine-tuning from')
-    parser.add_argument('--batch-size', default=1, type=int)
-    parser.add_argument('--ckp-dir', default=Path('./checkpoints_qat'), type=Path)
+    parser.add_argument('--batch-size', default=4, type=int)
+    parser.add_argument('--ckp-dir', default=Path('models/checkpoints_qat'), type=Path)
     parser.add_argument('--learning-rate', dest='lr', default=1e-5, type=float,
                          help='QAT fine-tuning LR -- much smaller than train_pytorch.py\'s '
                               'from-scratch default, since this only lightly adapts '
@@ -105,8 +106,11 @@ def main():
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, drop_last=True)
 
     global_step = 0
+    best_loss = float('inf')
+    best_epoch = None
     for epoch in range(args.num_epoch):
         prepared.train()
+        epoch_losses = []
         for imgs, g_means in tqdm(train_loader, dynamic_ncols=True):
             imgs, gt, norm_k = train_aug.transform(imgs, g_means)
 
@@ -116,14 +120,37 @@ def main():
             loss.backward()
             optimizer.step()
 
+            epoch_losses.append(loss.item())
             if global_step % 100 == 0:
                 tqdm.write(f"clock: {epoch}, loss: {loss.item()}")
             global_step += 1
 
-        if epoch % args.save_every == 0:
+        # Per-step loss (just printed above) is too noisy to judge convergence from --
+        # even at batch_size=4 the per-step coefficient of variation is still ~0.57
+        # (checked empirically against this dataset/config), so a single value can be
+        # several times the true average. The epoch mean below is what should actually
+        # be watched, and is also what "the checkpoint with minimum loss" is defined
+        # against, since there's no held-out validation split in this pipeline.
+        epoch_loss = float(np.mean(epoch_losses))
+        tqdm.write(f"epoch {epoch} mean loss: {epoch_loss:.4f}")
+
+        save_regular = (epoch % args.save_every == 0)
+        is_new_best = epoch_loss < best_loss
+        if save_regular or is_new_best:
             prepared.eval()
             state_dict = extract_float_state_dict(prepared)
-            torch.save(state_dict, args.ckp_dir / f"epoch_{epoch}.ckp")
+
+            if save_regular:
+                torch.save(state_dict, args.ckp_dir / f"epoch_{epoch}.ckp")
+
+            if is_new_best:
+                if best_epoch is not None:
+                    old_best_path = args.ckp_dir / f"epoch_best_{best_epoch}.ckp"
+                    if old_best_path.exists():
+                        old_best_path.unlink()
+                torch.save(state_dict, args.ckp_dir / f"epoch_best_{epoch}.ckp")
+                best_loss, best_epoch = epoch_loss, epoch
+                tqdm.write(f"new best checkpoint: epoch {epoch}, mean loss {epoch_loss:.4f}")
 
 
 if __name__ == "__main__":

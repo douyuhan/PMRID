@@ -24,3 +24,20 @@ python quantize_onnx.py models/torch_pretrained_fp32_256x256.onnx --benchmark da
 
 python tile_infer_hw.py --onnx models/torch_pretrained_fp32_256x256_int8.onnx --benchmark dataset/test/meta_info.json --save-dir data_output/test_onnx_int8_hw (--compare-full models/torch_pretrained.ckp)
 
+--------------------------------------------------------------------------------------------
+QAT：
+use original train dataset (SID, Sony). Currently workflow: train_qat -> export onnx -> quantize onnx
+
+- train_qat:
+python train_qat_pytorch.py --data-dir dataset/SID_Sony_raw --num-epoch 50
+
+- export onnx:
+python export_onnx.py models/checkpoints_qat/epoch_49.ckp --height 256 --width 256 --dtype fp32 --output models/qat_fp32_256x256_epoch49.onnx
+
+- PTQ:
+python quantize_onnx.py models/qat_fp32_256x256_epoch49.onnx --benchmark dataset/calibrate/calibrate.json --num-tiles 200 --output models/qat_int8_256x256_epoch49.onnx
+
+- valid:
+python tile_infer.py --onnx models/qat_fp32_256x256_epoch49.onnx --dtype fp32 --benchmark dataset/test/meta_info.json --save-dir data_output/test_qat_onnx_fp32_epoch49
+
+python tile_infer.py --onnx models/qat_int8_256x256_epoch49.onnx --dtype fp32 --benchmark dataset/test/meta_info.json --save-dir data_output/test_qat_onnx_int8_epoch49 (--compare-full models/checkpoints_qat/epoch_9.ckp)
