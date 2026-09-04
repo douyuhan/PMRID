@@ -10,7 +10,7 @@ from pathlib import Path
 
 import numpy as np
 import onnxruntime as ort
-from onnxruntime.quantization import CalibrationDataReader, CalibrationMethod, QuantFormat, QuantType, quantize_static
+from onnxruntime.quantization import CalibrationDataReader, CalibrationMethod, QuantFormat, QuantType, quantize_static, quantize_dynamic
 
 from utils import RawUtils
 from dataset.benchmark import BenchmarkLoader
@@ -29,13 +29,42 @@ CALIBRATE_METHOD = {
 def parse_args():
     parser = argparse.ArgumentParser(description="Post-training static int8 quantization of a fp32 PMRID ONNX export")
     parser.add_argument('model', type=Path, help='fp32 ONNX model to quantize, exported by export_onnx.py WITHOUT --bake-ksigma (see below for why)')
-    parser.add_argument('--benchmark', type=Path, required=True, help='benchmark.json/meta_info.json-style dataset to source calibration tiles from (real images, not synthetic data -- calibration quality depends on this being representative of real deployment inputs)')
+    parser.add_argument('--benchmark', type=Path, default=None, help='benchmark.json/meta_info.json-style dataset to source calibration tiles from (real images, not synthetic data -- calibration quality depends on this being representative of real deployment inputs). Required unless --dynamic is set (dynamic quantization needs no calibration data at all)')
     parser.add_argument('--output', type=Path, default=None, help='output .onnx path; defaults to <model>_int8.onnx')
+    parser.add_argument(
+        '--dynamic', action='store_true',
+        help="use onnxruntime's dynamic quantization (quantize_dynamic) instead of the "
+             "default static quantization (quantize_static): activation scale/zero-point is "
+             "computed fresh from the actual tensor on every inference call, instead of one "
+             "constant baked in from --benchmark calibration data (which --dynamic doesn't "
+             "need at all -- --num-tiles/--calibrate-method/--activation-type/--quant-format "
+             "are ignored in this mode, they're static-only). Confirmed empirically to fix a "
+             "real static-quantization failure mode on this network: KSigma normalizes "
+             "different ISOs toward the same anchor noise level by compressing overall "
+             "activation magnitude by up to ~31x between low and high ISO (see CLAUDE.md) -- "
+             "one static scale, calibrated across that whole range, is dominated by the large "
+             "low-ISO values and starves the much-smaller high-ISO activations of "
+             "quantization levels. Dynamic quantization sidesteps this since there's no "
+             "shared scale across calls to begin with -- verified: mean abs diff vs. fp32 on "
+             "high-ISO dataset/test samples dropped from 0.012-0.043 (static) to "
+             "0.0022-0.0034 (dynamic), no longer growing with ISO the way static's did. "
+             "Trade-offs: this network's ConvTranspose2d layers (one per DecoderStage, 4 "
+             "total) have no dynamic-quant kernel in onnxruntime and stay fp32 -- confirmed "
+             "empirically, not a pure int8 graph -- and computing the scale on every call has "
+             "real runtime cost vs. static quantization's baked-in constant; profile before "
+             "assuming this is free on the actual deployment target, and note it only helps "
+             "on runtimes that support computing quantization parameters at inference time. "
+             "A fixed-function int8 accelerator needing pre-baked static scales cannot use "
+             "this fix -- an external per-ISO rescale was tried as an alternative and found "
+             "not to work (see CLAUDE.md): it necessarily undoes KSigma's own noise-level "
+             "normalization along with the magnitude it was meant to only correct, since "
+             "they're the same multiplication, not separable.")
     parser.add_argument('--num-tiles', type=int, default=200, help='target number of calibration tiles to collect (stops early once reached; prints a warning instead of silently returning fewer if the dataset runs out first)')
     parser.add_argument('--per-channel', action=argparse.BooleanOptionalAction, default=True, help='quantize conv weights with one scale per output channel instead of one scale for the whole tensor. Recommended on: this network is mostly depthwise-separable convs (models/net_torch.py), whose per-channel weight magnitudes can vary a lot, so per-channel quantization typically preserves accuracy much better here than per-tensor')
     parser.add_argument('--calibrate-method', type=str, default='minmax', choices=list(CALIBRATE_METHOD), help="activation calibration method (onnxruntime.quantization.CalibrationMethod). 'minmax' is onnxruntime's own default and simplest/fastest; 'entropy'/'percentile' are more robust to outlier activations at the cost of a slower calibration pass -- worth trying if minmax's PSNR/SSIM hit is too large")
     parser.add_argument('--activation-type', type=str, default='int8', choices=list(QUANT_TYPE), help='activation quantization dtype (onnxruntime default: int8/symmetric)')
     parser.add_argument('--weight-type', type=str, default='int8', choices=list(QUANT_TYPE), help='weight quantization dtype (onnxruntime default: int8/symmetric)')
+    parser.add_argument('--reduce-range', action='store_true', help="quantize weights to 7-bit instead of 8-bit. onnxruntime's own docs frame this as a CPU-compatibility knob (avoids dot-product overflow on non-VNNI x86 CPUs, particularly with --per-channel), not a pure accuracy lever -- effect on this network's actual output quality is untested here, try empirically")
     parser.add_argument(
         '--quant-format', type=str, default='qdq', choices=['qdq', 'qoperator'],
         help="'qdq' (default) inserts QuantizeLinear/DequantizeLinear node pairs around quantized ops "
@@ -119,6 +148,9 @@ def collect_calibration_tiles(bm_loader: BenchmarkLoader, tile_h: int, tile_w: i
 def main():
     opt = parse_args()
 
+    if not opt.dynamic and opt.benchmark is None:
+        raise SystemExit('--benchmark is required unless --dynamic is set')
+
     sess = ort.InferenceSession(str(opt.model), providers=['CPUExecutionProvider'])
     inputs = sess.get_inputs()
     if len(inputs) != 1:
@@ -131,37 +163,61 @@ def main():
         )
     if inputs[0].type != 'tensor(float)':
         raise ValueError(
-            f"{opt.model}'s input is {inputs[0].type}, not tensor(float) -- quantize_static expects "
-            f"a float32 source graph. Re-run export_onnx.py with --dtype fp32 (not fp16) first."
+            f"{opt.model}'s input is {inputs[0].type}, not tensor(float) -- quantize_static/"
+            f"quantize_dynamic expect a float32 source graph. Re-run export_onnx.py with "
+            f"--dtype fp32 (not fp16) first."
         )
-    input_name = inputs[0].name
-    tile_h, tile_w = inputs[0].shape[2:]
-
-    bm_loader = BenchmarkLoader(opt.benchmark.resolve())
-    tiles = collect_calibration_tiles(bm_loader, tile_h, tile_w, opt.num_tiles)
-    reader = RGGBCalibrationDataReader(tiles, input_name)
 
     output_path = opt.output or opt.model.with_name(f'{opt.model.stem}_int8.onnx')
-    quantize_static(
-        model_input=str(opt.model),
-        model_output=str(output_path),
-        calibration_data_reader=reader,
-        quant_format=QuantFormat.QDQ if opt.quant_format == 'qdq' else QuantFormat.QOperator,
-        per_channel=opt.per_channel,
-        activation_type=QUANT_TYPE[opt.activation_type],
-        weight_type=QUANT_TYPE[opt.weight_type],
-        calibrate_method=CALIBRATE_METHOD[opt.calibrate_method],
-    )
+
+    if opt.dynamic:
+        quantize_dynamic(
+            model_input=str(opt.model),
+            model_output=str(output_path),
+            per_channel=opt.per_channel,
+            weight_type=QUANT_TYPE[opt.weight_type],
+            reduce_range=opt.reduce_range,
+        )
+    else:
+        input_name = inputs[0].name
+        tile_h, tile_w = inputs[0].shape[2:]
+
+        bm_loader = BenchmarkLoader(opt.benchmark.resolve())
+        tiles = collect_calibration_tiles(bm_loader, tile_h, tile_w, opt.num_tiles)
+        reader = RGGBCalibrationDataReader(tiles, input_name)
+
+        quantize_static(
+            model_input=str(opt.model),
+            model_output=str(output_path),
+            calibration_data_reader=reader,
+            quant_format=QuantFormat.QDQ if opt.quant_format == 'qdq' else QuantFormat.QOperator,
+            per_channel=opt.per_channel,
+            activation_type=QUANT_TYPE[opt.activation_type],
+            weight_type=QUANT_TYPE[opt.weight_type],
+            calibrate_method=CALIBRATE_METHOD[opt.calibrate_method],
+            reduce_range=opt.reduce_range,
+        )
 
     fp32_size = opt.model.stat().st_size
     int8_size = output_path.stat().st_size
     print(f'Exported to {output_path} ({int8_size/1e6:.2f} MB, vs {fp32_size/1e6:.2f} MB fp32 -- {fp32_size/int8_size:.2f}x smaller)')
-    print(
-        'This is only calibrated, not validated -- re-run the PSNR/SSIM benchmark against this '
-        'int8 model (e.g. via tile_infer.py) and compare to the fp32 baseline before trusting it. '
-        'A meaningful PSNR/SSIM drop means try --calibrate-method entropy/percentile, more '
-        '--num-tiles, or --per-channel if it was off.'
-    )
+    if opt.dynamic:
+        print(
+            'Dynamic quantization: this network\'s 4 ConvTranspose2d layers (one per '
+            'DecoderStage) have no dynamic-quant kernel in onnxruntime and were left fp32 -- '
+            'not a pure int8 graph. Still not automatically trusted -- re-run tile_infer.py '
+            '(or the full PSNR/SSIM benchmark) against the fp32 baseline before using this '
+            'for anything real, and profile inference speed on the actual target runtime '
+            '(computing the scale on every call has real cost vs. static quantization).'
+        )
+    else:
+        print(
+            'This is only calibrated, not validated -- re-run the PSNR/SSIM benchmark against this '
+            'int8 model (e.g. via tile_infer.py) and compare to the fp32 baseline before trusting it. '
+            'A meaningful PSNR/SSIM drop means try --calibrate-method entropy/percentile, more '
+            '--num-tiles, or --per-channel if it was off -- or, if the drop is specifically worse at '
+            'high ISO, try --dynamic instead (see its --help for why).'
+        )
 
 
 if __name__ == '__main__':
