@@ -21,8 +21,8 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Export a trained PMRID PyTorch checkpoint to a fixed-shape ONNX graph")
     parser.add_argument('model', type=Path, help='path to the pytorch checkpoint (state_dict), e.g. models/torch_pretrained.ckp')
     parser.add_argument('--output', type=Path, default=None, help='output .onnx path; defaults to <model>_<dtype>_<height>x<width>[_ksigma].onnx next to the checkpoint')
-    parser.add_argument('--height', type=int, default=256, help='network input height (in RGGB-plane space) baked into the exported graph; must be a multiple of 32 (the network downsamples 4x by 2x each stage)')
-    parser.add_argument('--width', type=int, default=256, help='network input width (in RGGB-plane space) baked into the exported graph; must be a multiple of 32')
+    parser.add_argument('--height', type=int, default=256, help='network input height (in RGGB-plane space) baked into the exported graph; must be a multiple of 16 (the network downsamples 16x via 4 encoder stages, each stride-2; the matching ConvTranspose2d decoder stages upsample back exactly, so 16 -- not 32 -- is the true architectural minimum, confirmed empirically). Going well below the 256 default costs quality for a different reason: at e.g. height=16 the bottleneck feature map is 1x1, losing nearly all spatial context')
+    parser.add_argument('--width', type=int, default=256, help='network input width (in RGGB-plane space) baked into the exported graph; must be a multiple of 16 (see --height)')
     parser.add_argument('--opset', type=int, default=13, help='ONNX opset version')
     parser.add_argument(
         '--dtype', type=str, default='fp32', choices=['fp32', 'fp16', 'int8'],
@@ -123,8 +123,8 @@ def main():
         return
 
     for dim_name, dim in (('height', opt.height), ('width', opt.width)):
-        if dim % 32 != 0:
-            raise ValueError(f'--{dim_name} must be a multiple of 32 (network downsamples 4x by 2x each stage), got {dim}')
+        if dim % 16 != 0:
+            raise ValueError(f'--{dim_name} must be a multiple of 16 (network downsamples 4x by 2x each stage), got {dim}')
 
     net = load_net(opt.model)
     # PMRID's network operates on 4-channel RGGB planes, not raw bayer or 3-channel RGB
