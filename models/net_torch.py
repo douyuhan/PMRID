@@ -143,8 +143,11 @@ class Network(nn.Module):
         self.out0 = DecoderBlock(in_channels=16, out_channels=16, kernel_size=3)
         self.out1 = Conv2D(in_channels=16, out_channels=4, kernel_size=3, stride=1, padding=1, is_seperable=False, has_relu=False)
 
-    def forward(self, inp):
-
+    def _shared_features(self, inp):
+        """Everything through out0: the 16-channel, H/2 x W/2 feature shared by the
+        denoise head (out1) and, in NetworkDemosaic, the demosaic head. Pulled out of
+        forward() as a pure refactor (same ops, same module names) so a subclass can
+        reuse this feature without duplicating the encoder/decoder call sequence."""
         conv0 = self.conv0(inp)
         conv1 = self.enc1(conv0)
         conv2 = self.enc2(conv1)
@@ -158,11 +161,78 @@ class Network(nn.Module):
         up1 = self.dec3((up2, conv1))
         x = self.dec4((up1, conv0))
 
-        x = self.out0(x)
+        return self.out0(x)
+
+    def forward(self, inp):
+        x = self._shared_features(inp)
         x = self.out1(x)
 
         pred = inp + x
         return pred
+
+
+class NetworkDemosaic(Network):
+    """Network, plus a second head that demosaics the already-denoised RGGB output
+    into a full-resolution RGB image, sharing the same encoder/decoder trunk (and so
+    the same pretrained weights -- see from_pretrained) as the denoise head.
+
+    The new head taps the same out0 feature as the denoise head (16ch, H/2 x W/2) --
+    the exact resolution a depth-to-space(x2) needs to land on a full-res H x W output
+    -- so no additional up/downsampling stages are needed. It predicts a residual on
+    top of a cheap bilinear demosaic of the *denoised* RGGB output (not the noisy
+    input), initialized to ~0 so training starts from that sane baseline rather than
+    from noise (see __init__'s zero-init of out1_rgb).
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.out1_rgb = Conv2D(
+            in_channels=16, out_channels=12, kernel_size=3, stride=1, padding=1,
+            is_seperable=False, has_relu=False,
+        )
+        self.pixel_shuffle = nn.PixelShuffle(2)
+        # Conv2D(is_seperable=False) returns nn.Sequential({'conv': nn.Conv2d(...)}),
+        # so the leaf module is .conv, not a plain attribute or a [-1] index.
+        nn.init.zeros_(self.out1_rgb.conv.weight)
+        nn.init.zeros_(self.out1_rgb.conv.bias)
+
+    @staticmethod
+    def bilinear_rggb_to_rgb(rggb):
+        """Cheap non-learned demosaic baseline: (N,4,H/2,W/2) RGGB -> (N,3,H,W) RGB,
+        used only as the residual's starting point (see __init__)."""
+        r = rggb[:, 0:1]
+        g = (rggb[:, 1:2] + rggb[:, 2:3]) / 2
+        b = rggb[:, 3:4]
+        rgb_half = torch.cat([r, g, b], dim=1)
+        return nn.functional.interpolate(rgb_half, scale_factor=2, mode='bilinear', align_corners=False)
+
+    def forward(self, inp):
+        feat = self._shared_features(inp)
+        denoised_rggb = inp + self.out1(feat)
+        rgb_residual = self.pixel_shuffle(self.out1_rgb(feat))
+        rgb = self.bilinear_rggb_to_rgb(denoised_rggb) + rgb_residual
+        return denoised_rggb, rgb
+
+    @classmethod
+    def from_pretrained(cls, ckp_path):
+        """Load a plain Network() denoise-only checkpoint (e.g. models/torch_pretrained.ckp)
+        into everything but the new demosaic head, which stays at its zero-init. Asserts
+        the checkpoint/model key mismatch is exactly the new head's 2 parameters, rather
+        than silently tolerating e.g. a typo'd module name leaving some other layer
+        un-loaded (same "verify, don't assume" spirit as train_qat_pytorch.py's
+        extract_float_state_dict)."""
+        net = cls()
+        state_dict = torch.load(str(ckp_path), map_location='cpu')
+        missing, unexpected = net.load_state_dict(state_dict, strict=False)
+        new_head_keys = {'out1_rgb.conv.weight', 'out1_rgb.conv.bias'}
+        if unexpected:
+            raise RuntimeError(f'unexpected keys in {ckp_path}: {unexpected}')
+        if set(missing) != new_head_keys:
+            raise RuntimeError(
+                f'expected only the new demosaic head {new_head_keys} to be missing from '
+                f'{ckp_path}, got {set(missing)}'
+            )
+        return net
 
 
 if __name__ == "__main__":

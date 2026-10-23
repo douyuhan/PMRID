@@ -92,6 +92,19 @@ class RawUtils:
         return res
 
     @classmethod
+    def rgb_to_mosaic_rggb(cls, rgb_01):
+        """Given an (H, W, 3) RGB image, sample R/G/G/B directly at the four positions
+        of each 2x2 block to simulate a single bayer CFA capture of it -- the synthetic
+        counterpart of bayer2rggb (same output shape/channel order: [top-left,
+        top-right, bottom-left, bottom-right] = [R, G, G, B]), used when there is no
+        real sensor mosaic to start from (see dataset/synthetic_mosaic.py)."""
+        r = rgb_01[0::2, 0::2, 0]
+        g_tr = rgb_01[0::2, 1::2, 1]
+        g_bl = rgb_01[1::2, 0::2, 1]
+        b = rgb_01[1::2, 1::2, 2]
+        return np.stack([r, g_tr, g_bl, b], axis=-1)
+
+    @classmethod
     def bayer2rgb(cls, *bayer_01s, wb_gain, CCM, gamma=2.2):
 
         wb_gain = np.array(wb_gain)[[0, 1, 1, 2]]

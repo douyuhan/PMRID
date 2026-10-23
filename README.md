@@ -106,6 +106,8 @@ The first five are **sensor-calibration constants** — this is also where the `
 
 ### QAT (quantization-aware training) fine-tuning
 
+**⚠️ Every result below predates a noise-synthesis bug fix (see "Joint denoising + demosaicing (JDD)" below) and has not been re-run.** `dataset/training_pytorch.py::DataAug.add_noise` had a bug that made synthesized training noise nearly independent of the actual clean image; `train_qat_pytorch.py` needs no code change to pick up the fix, but re-running it for post-fix numbers is deferred for now -- treat every finding below as observed under the old, now-fixed noise model.
+
 `train_qat_pytorch.py` fine-tunes an existing fp32 checkpoint with fake-quantization inserted (`prepare_qat_fx`, per-channel symmetric int8 weights — matching `quantize_onnx.py`'s own `--per-channel` default), so the exported weights are already shaped to tolerate that quantization scheme rather than only calibrating scale/zero-point after the fact. It shares the same data-augmentation CLI options as `train_pytorch.py` above (same Reno 10x defaults, `--iso-range` widened to `800 25600`):
 ```
 python3 train_qat_pytorch.py --init-ckp models/torch_pretrained.ckp --data-dir /path/to/clean_images --ckp-dir ./checkpoints_qat --num-epoch 20
@@ -118,6 +120,26 @@ python3 quantize_onnx.py qat_fp32.onnx --benchmark dataset/calibrate/calibrate.j
 **Tried end-to-end on real data (231 images, 20 epochs) — did not close the int8 quality gap.** The best-checkpoint's quantized result came out close to (not clearly better than) quantizing the vanilla non-QAT checkpoint; weights had only shifted ~2-5% in magnitude from the init checkpoint. See CLAUDE.md for the full result and — more importantly — the root cause this pointed to (a per-ISO activation magnitude mismatch that weight fine-tuning doesn't address; see the int8 quantization section below).
 
 **A stronger re-run (`--learning-rate 1e-4`, 10x, `--num-epoch 50`) made things worse, not better** — weights shifted more (confirmed: 1.22x max per-channel ratio vs. the earlier run's 1.05x) but the checkpoint's own fp32 output had already visibly degraded from the original (noisier render, confirmed both numerically — 0.02-0.08 mean abs diff vs. vanilla fp32 — and by eye), before quantization even entered the picture. Its quantized result was correspondingly worse too, compounding on an already-degraded baseline. Keep QAT learning rates conservative for this checkpoint/dataset (`~1e-5`) — a naive "bigger LR, more epochs" escalation actively hurts here.
+
+### Joint denoising + demosaicing (JDD) — experimental, Phase 1 (train_JDD_pytorch.py)
+
+`train_JDD_pytorch.py` fine-tunes `models/net_torch.py::NetworkDemosaic` — `Network` plus a second head, sharing the same encoder/decoder trunk, that demosaics the already-denoised RGGB output into a full-resolution RGB image (a `Conv2D(16→12)` + `PixelShuffle(2)` tapping the same `out0` feature the denoise head uses). A single network does both jobs in one forward pass (`pred_rggb, pred_rgb = net(noisy_rggb)`), fine-tuned from the existing denoise-only `models/torch_pretrained.ckp` rather than trained from scratch:
+
+```
+python3 train_JDD_pytorch.py \
+    --real-data-dir dataset/SID_Sony_raw \
+    --synth-image-dir /path/to/Kodak24/test \
+    --init-ckp models/torch_pretrained.ckp \
+    --ckp-dir ./checkpoints_jdd --num-epoch 10
+```
+
+Two complementary training data sources, alternated every step:
+- `--real-data-dir`: real sensor clean raw (`CleanRawImages` format, e.g. `dataset/SID_Sony_raw`) — physically correct noise synthesis, but no real demosaic ground truth exists for it yet, so it only supervises the denoise loss.
+- `--synth-image-dir`: ordinary sRGB photos (`dataset/synthetic_mosaic.py::SyntheticMosaicImages`), approximately linearized (`img ** 2.2`) and mosaicked (`RawUtils.rgb_to_mosaic_rggb`) — the un-mosaicked image is an *exact* demosaic ground truth, so these batches supervise both the denoise and (`--demosaic-weight`-scaled) demosaic losses. Both sources run through the same noise-synthesis/KSigma pipeline as the rest of this repo's training (`DataAug.transform`, now also carrying a parallel RGB ground truth through the same brightness/KSigma/inp_scale chain).
+
+**Phase 1 scope — validated the architecture and pipeline work end-to-end, not production quality.** Verified: the new head is zero-initialized so training starts from a sane bilinear-demosaic baseline; loading `models/torch_pretrained.ckp` reproduces the plain `Network`'s output exactly (the shared trunk really does carry the pretrained weights over unchanged); a smoke-test run (`dataset/SID_Sony_raw` + Kodak24/McMaster, 42 synthetic images, 2 epochs) trains without error with all losses finite and trending down, and a clean forward pass on a held-out image already visually matches its ground truth closely. Not yet done: `export_onnx.py`/`tile_infer.py` support for the new dual-output network, a real demosaic ground truth for the real-raw source (would need an offline teacher demosaic algorithm), and scaling the synthetic data source past 42 images. See CLAUDE.md for the full design rationale (in particular, why this stays in PMRID's linear raw domain rather than the gamma domain a standalone demosaic network would normally use).
+
+**A pre-existing noise-synthesis bug was found and fixed while building this**, in the training pipeline every noise-based training script here shares (`train_pytorch.py`, `train_qat_pytorch.py`, and this script): `dataset/training_pytorch.py::DataAug.add_noise` clamped its Poisson shot-noise rate to `[0, 1]`, but the image values it's computed from routinely reach into the hundreds (in `camera_value_scale` units) — so the clamp was crushing the synthesized noise to be nearly independent of the actual image for any non-near-black pixel (confirmed visually: a synthesized "noisy" mosaic was indistinguishable from pure static before the fix). Fixed by keeping only the lower bound (`.clamp(min=0)`). This predates and is unrelated to the JDD work itself — it's a bug in shared training infrastructure that this work happened to surface by being the first to visually compare a clean vs. noisy synthesized sample side by side. **Only `dataset/training_pytorch.py` was fixed** (`dataset/training.py`/`train_meg.py`, the MegEngine originals, have the identical bug but are no longer kept in sync — see above). `train_qat_pytorch.py` needs no code change to benefit from the fix, but re-running it for post-fix QAT results is being deferred for now (see the QAT section's warning above) — full details and evidence in CLAUDE.md.
 
 ## ONNX export & tiled inference
 

@@ -33,6 +33,28 @@ dataset/training.py and this file, so the two stay in sync:
     adding an `inp_scale` field to DataAugOptions (default 256.0, matching
     export_onnx.py/run_benchmark_pytorch.py's own default) and applying the matching
     `/ camera_value_scale * inp_scale` step at the end of DataAug.transform.
+
+Found later, and (per the sync-policy change noted above) fixed in this file only, not
+dataset/training.py: DataAug.add_noise's `shot_noisy = torch.poisson((img / k_t).clamp(0,
+1)) * k_t` clamped the Poisson rate's *upper* bound to 1. img lives in
+[0, camera_value_scale] (~0-959 for the Reno 10x defaults -- confirmed by both add_noise's
+own docstring and by k_sigma() operating on the exact same camera_value_scale-scaled
+tensors), while k_t is only ~0.5-15 over the calibrated ISO range, so img/k_t commonly
+reaches into the hundreds for any non-trivial brightness -- the upper clamp was crushing
+the Poisson rate to ~1 for virtually every non-near-black pixel, making shot_noisy
+~= Poisson(1)*k_t, i.e. nearly independent of img's actual value rather than noise added
+on top of it. Caught by directly visualizing a synthesized noisy mosaic next to its clean
+source (something no prior validation here had done -- only aggregate loss curves/shapes
+had been checked): the "noisy" image was visually indistinguishable from pure static.
+Ruled out a camera_value_scale/[0,1] domain mismatch in transform()'s call site first
+(the read-noise term sqrt(b) -- unaffected by this clamp -- would be 100%-2200% of full
+scale if img were [0,1], vs. a believable 0.1%-2.3% of camera_value_scale; img_add_noise
+and k_sigma already use the identical camera_value_scale-scaled tensors). Fixed by keeping
+only the lower bound (`.clamp(min=0)`, still needed to keep the Poisson rate
+non-negative): confirmed the same mosaic's structure becomes visible again, with mean abs
+diff vs. the clean mosaic dropping ~13x (1.47e-1 -> 1.14e-2 on a [0,1] scale, ISO 3200).
+This clamp is present identically in dataset/training.py (`.clip(0, 1)`, same line) --
+confirmed to predate this port, not introduced by it.
 """
 import json
 import math
@@ -200,20 +222,29 @@ class DataAug:
         self.noise_func = NoiseProfileFunc(opts.noise_profile)
         self.device = torch.device(device)
 
-    def transform(self, batch_img01: torch.Tensor, batch_g_mean) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def transform(self, batch_img01: torch.Tensor, batch_g_mean, batch_rgb01: torch.Tensor = None):
         """
         Args:
             - batch_img01: (N, 4, H, W) float32 tensor, clean RGGB in [0, 1] (as returned
               by CleanRawImages, batched by the DataLoader's default collate)
             - batch_g_mean: (N,) per-sample mean green-channel brightness in [0, 1]
+            - batch_rgb01: optional (N, 3, 2H, 2W) float32 tensor, an exact full-resolution
+              RGB ground truth for the same scene as batch_img01 (as returned by
+              dataset/synthetic_mosaic.py::SyntheticMosaicImages, whose RGGB is a direct
+              mosaic of this RGB -- unlike CleanRawImages, which has no RGB counterpart at
+              all). When given, it is carried through the *same* brightness/KSigma/
+              inp_scale affine chain as batch_gt (so a demosaic loss against it is
+              consistent with the denoise loss's domain) but never has noise added, since
+              it's the demosaic target, not a noisy input.
 
         Returns:
             - noisy_img (network input)
             - gt (network target)
             - norm_k (per-sample loss normalization factor, for get_loss_l1)
+            - gt_rgb (only when batch_rgb01 is given)
         """
         batch_imgs = batch_img01.to(self.device, dtype=torch.float32) * self.opts.camera_value_scale
-        batch_gt = self.brightness_aug(batch_imgs, batch_g_mean)
+        batch_gt, brightness_scale = self.brightness_aug(batch_imgs, batch_g_mean)
         batch_imgs, batch_iso = self.add_noise(batch_gt)
         cvt_k, cvt_b = self.k_sigma(batch_iso)
 
@@ -228,7 +259,14 @@ class DataAug:
         batch_imgs = batch_imgs / self.opts.camera_value_scale * self.opts.inp_scale
         batch_gt = batch_gt / self.opts.camera_value_scale * self.opts.inp_scale
 
-        return batch_imgs, batch_gt, cvt_k
+        if batch_rgb01 is None:
+            return batch_imgs, batch_gt, cvt_k
+
+        batch_rgb = batch_rgb01.to(self.device, dtype=torch.float32) * self.opts.camera_value_scale
+        batch_rgb = batch_rgb * brightness_scale
+        batch_rgb = batch_rgb * cvt_k + cvt_b
+        batch_rgb = batch_rgb / self.opts.camera_value_scale * self.opts.inp_scale
+        return batch_imgs, batch_gt, cvt_k, batch_rgb
 
     def k_sigma(self, iso: np.ndarray) -> Tuple[torch.Tensor, torch.Tensor]:
         k, sigma = self.noise_func(iso, value_scale=self.opts.camera_value_scale)
@@ -241,14 +279,17 @@ class DataAug:
         cvt_b = torch.as_tensor(cvt_b, dtype=torch.float32, device=self.device).reshape(-1, 1, 1, 1)
         return cvt_k, cvt_b
 
-    def brightness_aug(self, img_batch: torch.Tensor, orig_gmean) -> torch.Tensor:
+    def brightness_aug(self, img_batch: torch.Tensor, orig_gmean) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Returns (darkened_batch, scale) -- the scale is exposed so transform() can
+        apply the identical per-sample darkening to a parallel RGB ground truth tensor
+        without redrawing a different random scale for it."""
         low, high = self.opts.target_brighness_range
         orig_gmean = np.asarray(orig_gmean)
         N = len(orig_gmean)
         btarget = np.exp(np.random.uniform(np.log(low), np.log(high), size=(N,)))
         s = np.clip(btarget / orig_gmean, 0.01, 1.0)
         s = torch.as_tensor(s, dtype=torch.float32, device=self.device).reshape(-1, 1, 1, 1)
-        return img_batch * s
+        return img_batch * s, s
 
     def add_noise(self, img: torch.Tensor) -> Tuple[torch.Tensor, np.ndarray]:
         """
@@ -266,7 +307,24 @@ class DataAug:
         k_t = torch.as_tensor(k, dtype=torch.float32, device=self.device).reshape(-1, 1, 1, 1)
         b_t = torch.as_tensor(b, dtype=torch.float32, device=self.device).reshape(-1, 1, 1, 1)
 
-        shot_noisy = torch.poisson((img / k_t).clamp(0, 1)) * k_t
+        # The Poisson rate img/k_t is NOT generally <=1: img lives in [0, camera_value_scale]
+        # (~0-959 for the Reno 10x defaults, confirmed by both this function's own docstring
+        # and by k_sigma() using the exact same camera_value_scale-scaled tensors), while k_t
+        # is only ~0.5-15 over the calibrated ISO range -- so img/k_t commonly reaches into the
+        # hundreds for any non-trivial brightness. An upper clamp of 1 here (as this line
+        # previously read: `.clamp(0, 1)`) was confirmed to crush the Poisson rate to ~1 for
+        # virtually every non-near-black pixel, making shot_noisy ~= Poisson(1)*k_t --
+        # essentially independent of img's actual value, i.e. not noise added to the image but
+        # a near-total replacement of it with noise. Verified directly: with the old clamp, a
+        # synthesized "noisy" mosaic was visually indistinguishable from pure static; with only
+        # the (still necessary, to keep the Poisson rate non-negative) lower bound kept, the
+        # same mosaic's underlying structure is clearly visible again, with mean abs diff vs.
+        # the clean mosaic dropping ~13x (1.47e-1 -> 1.14e-2 on a [0,1] scale, ISO 3200). This
+        # clamp(0, 1) bug is inherited from the original dataset/training.py (MegEngine) --
+        # confirmed present there too (same `.clip(0, 1)`, line ~205) -- so it predates this
+        # port and is not re-synced there per this repo's policy of no longer porting fixes to
+        # the MegEngine training code (see this file's module docstring).
+        shot_noisy = torch.poisson((img / k_t).clamp(min=0)) * k_t
         read_noisy = torch.randn(img.shape, device=self.device) * torch.sqrt(b_t)
         noisy = shot_noisy + read_noisy
         noisy = torch.round(noisy)
