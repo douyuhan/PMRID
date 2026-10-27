@@ -21,6 +21,7 @@ Reno 10x sensor-calibration defaults), and the best-checkpoint tracking pattern
 (epoch_best_{epoch}.ckp, previous best deleted) from train_qat_pytorch.py.
 """
 import argparse
+import json
 import platform
 from itertools import cycle
 from pathlib import Path
@@ -42,6 +43,60 @@ from train_pytorch import add_data_aug_args, build_data_aug_options, get_loss_l1
 # foreground work on this no-GPU machine. Not meaningful on non-Windows platforms.
 BELOW_NORMAL_PRIORITY_CLASS = 0x00004000
 IDLE_PRIORITY_CLASS = 0x00000040
+
+# Written/updated after every epoch, alongside the regular epoch_{N}.ckp checkpoints, so an
+# interrupted run (e.g. the machine sleeping overnight -- observed twice in practice on this
+# GPU-less, left-running-for-hours setup) can pick back up without redoing already-completed
+# epochs. Deliberately does NOT persist optimizer state (Adam's moment estimates reset on
+# resume) -- an acceptable simplification given the small LR and thousands of steps per epoch
+# make the resulting transient negligible and self-correcting within a few steps.
+TRAINING_STATE_FILENAME = 'training_state.json'
+
+
+def load_resume_state(ckp_dir: Path):
+    """If ckp_dir has a training_state.json from a previous (interrupted) run of this
+    script, return (net, start_epoch, best_loss, best_epoch) to continue from; else None."""
+    state_path = ckp_dir / TRAINING_STATE_FILENAME
+    if not state_path.exists():
+        return None
+    state = json.loads(state_path.read_text())
+    ckp_path = ckp_dir / f"epoch_{state['epoch']}.ckp"
+    if not ckp_path.exists():
+        print(f"warning: {state_path} refers to epoch {state['epoch']} but {ckp_path} is "
+              f"missing -- ignoring resume state and starting fresh from --init-ckp")
+        return None
+    net = NetworkDemosaic()
+    net.load_state_dict(torch.load(str(ckp_path), map_location='cpu'))
+    print(f"resuming from {ckp_path} (epoch {state['epoch']} complete, "
+          f"best_loss={state['best_loss']:.4f} at epoch {state['best_epoch']})")
+    return net, state['epoch'] + 1, state['best_loss'], state['best_epoch']
+
+
+def save_resume_state(ckp_dir: Path, epoch: int, best_loss: float, best_epoch):
+    state_path = ckp_dir / TRAINING_STATE_FILENAME
+    state_path.write_text(json.dumps({'epoch': epoch, 'best_loss': best_loss, 'best_epoch': best_epoch}))
+
+
+# Append-only per-epoch loss history, separate from training_state.json (which only ever
+# holds the *current* resume point, overwritten every epoch -- by design, since it's meant
+# to answer "where do I resume from," not "what did every epoch's loss look like"). Opened
+# in append mode and written with a plain file write (not through PowerShell's
+# -RedirectStandardOutput, which truncates train_stdout.log on every wrapper relaunch --
+# confirmed losing every prior epoch's "epoch N mean loss" line across a resume) so the full
+# per-epoch curve survives any number of interruptions/relaunches, independent of how the
+# process is wrapped.
+EPOCH_HISTORY_FILENAME = 'epoch_history.csv'
+EPOCH_HISTORY_HEADER = 'epoch,mean_loss,mean_real_denoise,mean_synth_denoise,mean_demosaic\n'
+
+
+def append_epoch_history(ckp_dir: Path, epoch: int, mean_loss: float,
+                          mean_real_denoise: float, mean_synth_denoise: float, mean_demosaic: float):
+    path = ckp_dir / EPOCH_HISTORY_FILENAME
+    write_header = not path.exists()
+    with path.open('a') as f:
+        if write_header:
+            f.write(EPOCH_HISTORY_HEADER)
+        f.write(f'{epoch},{mean_loss},{mean_real_denoise},{mean_synth_denoise},{mean_demosaic}\n')
 
 
 def limit_cpu_usage(num_threads: int, low_priority: bool):
@@ -110,6 +165,10 @@ def main():
                          help='run this process at Windows BELOW_NORMAL priority (default on) so '
                               'the OS scheduler favors the user\'s foreground work; pass '
                               '--no-low-priority to disable')
+    parser.add_argument('--auto-resume', action=argparse.BooleanOptionalAction, default=True,
+                         help='if --ckp-dir already has a training_state.json from a previous '
+                              '(interrupted) run, continue from there instead of --init-ckp; '
+                              'pass --no-auto-resume to always start fresh from --init-ckp')
     args = parser.parse_args()
 
     limit_cpu_usage(args.cpu_threads, args.low_priority)
@@ -117,7 +176,13 @@ def main():
     args.ckp_dir.mkdir(parents=True, exist_ok=True)
     device = torch.device(args.device)
 
-    net = NetworkDemosaic.from_pretrained(args.init_ckp).to(device)
+    resumed = load_resume_state(args.ckp_dir) if args.auto_resume else None
+    if resumed is not None:
+        net, start_epoch, best_loss, best_epoch = resumed
+        net = net.to(device)
+    else:
+        net = NetworkDemosaic.from_pretrained(args.init_ckp).to(device)
+        start_epoch, best_loss, best_epoch = 0, float('inf'), None
     optimizer = optim.Adam(net.parameters(), lr=args.lr)
 
     aug_opts = build_data_aug_options(args)
@@ -129,15 +194,14 @@ def main():
     synth_loader = DataLoader(synth_ds, batch_size=args.batch_size, shuffle=True, drop_last=True)
 
     global_step = 0
-    best_loss = float('inf')
-    best_epoch = None
-    for epoch in range(args.num_epoch):
+    for epoch in range(start_epoch, args.num_epoch):
         net.train()
         # synth_loader (e.g. 42 Kodak24/McMaster images) is far smaller than real_loader
         # (e.g. 231 SID_Sony_raw images), so it determines how many steps make up one
         # epoch here; real_loader is cycled to keep supplying batches alongside it.
         real_iter = cycle(real_loader)
         epoch_losses = []
+        epoch_real_denoise, epoch_synth_denoise, epoch_demosaic = [], [], []
         for synth_batch in tqdm(synth_loader, dynamic_ncols=True):
             # --- real raw: denoise loss only (no real demosaic ground truth yet) ---
             imgs, g_means = next(real_iter)
@@ -160,6 +224,9 @@ def main():
             optimizer.step()
 
             epoch_losses.append(loss_real.item() + loss_synth.item())
+            epoch_real_denoise.append(loss_real.item())
+            epoch_synth_denoise.append(loss_denoise.item())
+            epoch_demosaic.append(loss_demosaic.item())
             if global_step % args.log_every == 0:
                 tqdm.write(
                     f"epoch {epoch} step {global_step}: real_denoise={loss_real.item():.4f} "
@@ -172,6 +239,10 @@ def main():
         # is defined against, since there's no held-out validation split here either.
         epoch_loss = float(np.mean(epoch_losses))
         tqdm.write(f"epoch {epoch} mean loss: {epoch_loss:.4f}")
+        append_epoch_history(
+            args.ckp_dir, epoch, epoch_loss,
+            float(np.mean(epoch_real_denoise)), float(np.mean(epoch_synth_denoise)), float(np.mean(epoch_demosaic)),
+        )
 
         save_regular = (epoch % args.save_every == 0)
         is_new_best = epoch_loss < best_loss
@@ -190,6 +261,11 @@ def main():
                 torch.save(state_dict, args.ckp_dir / f"epoch_best_{epoch}.ckp")
                 best_loss, best_epoch = epoch_loss, epoch
                 tqdm.write(f"new best checkpoint: epoch {epoch}, mean loss {epoch_loss:.4f}")
+
+            if save_regular:
+                # only meaningful to resume from a regular epoch_{N}.ckp (always written when
+                # save_regular), not from an epoch that only produced an epoch_best_*.ckp
+                save_resume_state(args.ckp_dir, epoch, best_loss, best_epoch)
 
 
 if __name__ == "__main__":
