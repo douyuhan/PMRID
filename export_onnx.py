@@ -6,7 +6,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from models.net_torch import Network
+from models.net_torch import Network, NetworkDemosaic
 
 # same defaults as run_benchmark_pytorch.py/tile_infer.py's KSigma(...) instantiation
 # (Reno 10x noise calibration); overridable via --k-coeff/--b-coeff/--anchor/--v for a
@@ -33,6 +33,14 @@ def parse_args():
              "int8 is a reserved placeholder, see below.",
     )
     parser.add_argument(
+        '--jdd', action='store_true',
+        help="export a models/net_torch.py::NetworkDemosaic checkpoint (e.g. from "
+             "train_JDD_pytorch.py) instead of a plain denoise-only Network. The exported "
+             "graph gets two outputs, 'denoised_rggb' and 'rgb' (torch.onnx.export handles "
+             "the tuple return automatically). Not combinable with --bake-ksigma (not "
+             "implemented for NetworkDemosaic yet).",
+    )
+    parser.add_argument(
         '--bake-ksigma', action='store_true',
         help="also export the ISO-dependent KSigma normalize/denormalize affine transform "
              "(run_benchmark_pytorch.py's KSigma) into the graph, instead of leaving it to be "
@@ -50,10 +58,12 @@ def parse_args():
     return parser.parse_args()
 
 
-def load_net(model_path: Path) -> Network:
-    net = Network()
+def load_net(model_path: Path, jdd: bool = False) -> Network:
+    net = NetworkDemosaic() if jdd else Network()
     state_dict = torch.load(str(model_path), map_location='cpu')
-    net.load_state_dict(state_dict)
+    net.load_state_dict(state_dict)  # strict=True either way: a train_JDD_pytorch.py
+    # checkpoint already has every NetworkDemosaic key (unlike NetworkDemosaic.from_pretrained,
+    # which is for loading a plain denoise-only checkpoint into a fresh demosaic head)
     return net.eval()
 
 
@@ -126,7 +136,12 @@ def main():
         if dim % 16 != 0:
             raise ValueError(f'--{dim_name} must be a multiple of 16 (network downsamples 4x by 2x each stage), got {dim}')
 
-    net = load_net(opt.model)
+    if opt.jdd and opt.bake_ksigma:
+        raise ValueError('--jdd does not support --bake-ksigma yet (NetworkDemosaic has no '
+                          'KSigma-baked wrapper -- only the plain external-KSigma export path '
+                          'is implemented); drop one of the two flags.')
+
+    net = load_net(opt.model, jdd=opt.jdd)
     # PMRID's network operates on 4-channel RGGB planes, not raw bayer or 3-channel RGB
     dummy_rggb = torch.randn(1, 4, opt.height, opt.width, dtype=torch.float32)
 
@@ -141,7 +156,11 @@ def main():
         dummy_args = (dummy_rggb,)
         input_names = ['input']
 
-    suffix = '_ksigma' if opt.bake_ksigma else ''
+    # NetworkDemosaic.forward returns a (denoised_rggb, rgb) tuple -- torch.onnx.export
+    # handles a tuple return automatically, giving the graph two outputs in this order
+    output_names = ['denoised_rggb', 'rgb'] if opt.jdd else ['output']
+
+    suffix = '_jdd' if opt.jdd else ('_ksigma' if opt.bake_ksigma else '')
     output_path = opt.output or opt.model.with_name(f'{opt.model.stem}_{opt.dtype}_{opt.height}x{opt.width}{suffix}.onnx')
 
     # Always trace/export in float32 (see --dtype help above for why); for --dtype fp16 we
@@ -149,7 +168,7 @@ def main():
     export_path = output_path if opt.dtype == 'fp32' else output_path.with_suffix('.fp32tmp.onnx')
     torch.onnx.export(
         model, dummy_args, str(export_path),
-        input_names=input_names, output_names=['output'],
+        input_names=input_names, output_names=output_names,
         opset_version=opt.opset,
         dynamo=False,  # this graph is static (no control flow); skip the dynamo exporter to avoid the extra onnxscript dependency
     )
@@ -162,7 +181,8 @@ def main():
         export_path.unlink()
 
     ksigma_note = f', ksigma baked in (iso is a graph input)' if opt.bake_ksigma else ''
-    print(f'Exported to {output_path} (dtype={opt.dtype}, shape=1x4x{opt.height}x{opt.width}{ksigma_note})')
+    jdd_note = ', JDD (denoise+demosaic, 2 outputs)' if opt.jdd else ''
+    print(f'Exported to {output_path} (dtype={opt.dtype}, shape=1x4x{opt.height}x{opt.width}{ksigma_note}{jdd_note})')
 
     # verify the exported graph reproduces the PyTorch (float32) output, within the dtype's precision
     import onnxruntime as ort
@@ -171,11 +191,13 @@ def main():
     feed = {'input': dummy_rggb.numpy().astype(onnx_dtype)}
     if opt.bake_ksigma:
         feed['iso'] = dummy_iso.numpy().astype(onnx_dtype)
-    onnx_out = sess.run(None, feed)[0]
+    onnx_outs = sess.run(None, feed)
     with torch.no_grad():
-        torch_out = model(*dummy_args).numpy()
-    diff = np.abs(onnx_out.astype(np.float64) - torch_out.astype(np.float64)).max()
-    print(f'ONNX ({opt.dtype}) vs PyTorch float32 max abs diff: {diff:.3e}')
+        torch_result = model(*dummy_args)
+    torch_outs = list(torch_result) if opt.jdd else [torch_result]
+    for name, onnx_out, torch_out in zip(output_names, onnx_outs, torch_outs):
+        diff = np.abs(onnx_out.astype(np.float64) - torch_out.numpy().astype(np.float64)).max()
+        print(f'ONNX ({opt.dtype}) vs PyTorch float32 max abs diff [{name}]: {diff:.3e}')
 
 
 if __name__ == '__main__':

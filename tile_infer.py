@@ -8,7 +8,9 @@ from tqdm import tqdm
 
 from utils import RawUtils
 from dataset.benchmark import BenchmarkLoader
-from run_benchmark_pytorch import KSigma, Denoiser, save_rgb_png, save_bayer_raw
+from run_benchmark_pytorch import (
+    KSigma, Denoiser, DemosaicDenoiser, demosaic_rgb_to_display, save_rgb_png, save_bayer_raw,
+)
 
 # --dtype describes the ONNX graph's own declared EXTERNAL input/output tensor type --
 # i.e. what numpy dtype must be fed in / comes back out -- not whether the graph is
@@ -113,6 +115,47 @@ def tiled_infer_rggb(sess, input_name, rggb, tile_h, tile_w, margin, np_dtype, e
     return out[:H, :W], grid_info  # crop back off any reflect-padding
 
 
+def tiled_infer_rggb_dual(sess, input_name, rggb, tile_h, tile_w, margin, np_dtype, extra_feed=None):
+    """Like tiled_infer_rggb, but for a 2-output export_onnx.py --jdd graph (NetworkDemosaic):
+    the first output (denoised_rggb) is tiled/stitched exactly like tiled_infer_rggb; the
+    second (rgb) is at 2x the RGGB-plane resolution, so every tile position/ownership-bound
+    computed in input (RGGB-plane) space must be doubled before indexing into it -- same
+    scheme ../../AIDMSC_research/DMSC_NestUnet/tile_infer.py uses for its own network's 2x
+    upsampling L1 exit (tiled_infer_l1).
+    """
+    H, W = rggb.shape[:2]
+
+    pad_h, pad_w = max(0, tile_h - H), max(0, tile_w - W)
+    if pad_h or pad_w:
+        rggb = np.pad(rggb, [(0, pad_h), (0, pad_w), (0, 0)], mode='reflect')
+    Hp, Wp = rggb.shape[:2]
+
+    stride_h = max(tile_h - 2 * margin, 1)
+    stride_w = max(tile_w - 2 * margin, 1)
+    ys = tile_positions(Hp, tile_h, stride_h)
+    xs = tile_positions(Wp, tile_w, stride_w)
+    y_bounds = ownership_bounds(ys, tile_h, Hp)
+    x_bounds = ownership_bounds(xs, tile_w, Wp)
+
+    out_rggb = np.zeros((Hp, Wp, 4), np.float32)
+    out_rgb = np.zeros((Hp * 2, Wp * 2, 3), np.float32)
+    for i, y0 in enumerate(ys):
+        for j, x0 in enumerate(xs):
+            tile = rggb[y0:y0 + tile_h, x0:x0 + tile_w].transpose(2, 0, 1)[np.newaxis].astype(np_dtype)
+            feed = {input_name: tile, **(extra_feed or {})}
+            outputs = sess.run(None, feed)
+            tile_rggb = outputs[0][0].transpose(1, 2, 0).astype(np.float32)
+            tile_rgb = outputs[1][0].transpose(1, 2, 0).astype(np.float32)
+
+            oy0, oy1 = y_bounds[i], y_bounds[i + 1]
+            ox0, ox1 = x_bounds[j], x_bounds[j + 1]
+            out_rggb[oy0:oy1, ox0:ox1] = tile_rggb[oy0 - y0:oy1 - y0, ox0 - x0:ox1 - x0]
+            out_rgb[2*oy0:2*oy1, 2*ox0:2*ox1] = tile_rgb[2*(oy0-y0):2*(oy1-y0), 2*(ox0-x0):2*(ox1-x0)]
+
+    grid_info = f'{len(ys)}x{len(xs)} tiles (tile {tile_h}x{tile_w}, margin {margin}, stride {stride_h}x{stride_w})'
+    return out_rggb[:H, :W], out_rgb[:H*2, :W*2], grid_info
+
+
 class TiledOnnxDenoiser:
     """ONNX + tiling equivalent of run_benchmark_pytorch.py's Denoiser: same
     KSigma normalization / RGGB packing / inp_scale, but the network forward
@@ -173,6 +216,48 @@ class TiledOnnxDenoiser:
         return RawUtils.rggb2bayer(pred_rggb), grid_info
 
 
+class TiledOnnxDemosaicDenoiser:
+    """ONNX + tiling equivalent of run_benchmark_pytorch.py's DemosaicDenoiser: same
+    external KSigma normalization / RGGB packing / inp_scale as TiledOnnxDenoiser, but
+    over a 2-output export_onnx.py --jdd graph (tiled_infer_rggb_dual instead of
+    tiled_infer_rggb). No --bake-ksigma equivalent -- not implemented for NetworkDemosaic
+    (see export_onnx.py --jdd's own restriction), so this class only supports the plain
+    external-KSigma path.
+    """
+
+    def __init__(self, sess: ort.InferenceSession, margin: int, ksigma: KSigma, dtype: str, inp_scale=256.0):
+        self.sess = sess
+        self.input_name = sess.get_inputs()[0].name
+        self.tile_h, self.tile_w = sess.get_inputs()[0].shape[2:]
+        self.margin = margin
+        self.ksigma = ksigma
+        self.np_dtype = NP_DTYPE[dtype]
+        self.inp_scale = inp_scale
+
+    def run(self, bayer_01: np.ndarray, iso: float):
+        # same reflect-pad-by-margin scheme as TiledOnnxDenoiser.run -- see its comment
+        pad = self.margin
+        bayer_01 = np.pad(bayer_01, [(2*pad, 2*pad), (2*pad, 2*pad)], mode='reflect')
+
+        rggb = RawUtils.bayer2rggb(bayer_01).clip(0, 1)
+        rggb = self.ksigma(rggb, iso) * self.inp_scale
+        pred_rggb, pred_rgb, grid_info = tiled_infer_rggb_dual(
+            self.sess, self.input_name, rggb.astype(np.float32),
+            self.tile_h, self.tile_w, self.margin, self.np_dtype,
+        )
+        pred_rggb = pred_rggb / self.inp_scale
+        pred_rggb = self.ksigma(pred_rggb, iso, inverse=True)
+        pred_rgb = pred_rgb / self.inp_scale
+        pred_rgb = self.ksigma(pred_rgb, iso, inverse=True)  # same per-frame affine for both outputs
+
+        pred_rggb = pred_rggb[pad:-pad, pad:-pad]
+        # rgb is at 2x the RGGB-plane resolution, i.e. exactly the padded raw-pixel
+        # resolution -- crop by 2*pad (matching the raw-pixel padding amount above),
+        # not pad (which is sized for the half-resolution RGGB output)
+        pred_rgb = pred_rgb[2*pad:-2*pad, 2*pad:-2*pad]
+        return RawUtils.rggb2bayer(pred_rggb), pred_rgb, grid_info
+
+
 def main():
     parser = argparse.ArgumentParser(description="Tiled inference through a fixed-shape PMRID ONNX export, over real (arbitrary-size) raw images")
     parser.add_argument('--onnx', type=Path, required=True, help='fixed-shape ONNX model exported by export_onnx.py (without a dynamic H/W)')
@@ -210,7 +295,20 @@ def main():
              'step and instead feeds each sample\'s ISO straight into the graph as its second '
              'input, per tile, since normalize/denormalize already happen inside the graph.',
     )
+    parser.add_argument(
+        '--jdd', action='store_true',
+        help="--onnx is a 2-output export_onnx.py --jdd graph (NetworkDemosaic: denoise + "
+             "demosaic), not a plain 1-output denoise-only graph. Not combinable with "
+             "--bake-ksigma (export_onnx.py --jdd doesn't support it). Additionally saves "
+             "{name}_pred_demosaic.png from the network's own demosaic output -- see "
+             "run_benchmark_pytorch.py's demosaic_rgb_to_display for why this has no "
+             "PSNR/SSIM and no WB/CCM, and is expected to look off-color on real sensor raw.",
+    )
     args = parser.parse_args()
+
+    if args.jdd and args.bake_ksigma:
+        raise ValueError('--jdd does not support --bake-ksigma (export_onnx.py --jdd never '
+                          'produces that combination) -- drop one of the two flags.')
 
     if args.dtype == 'int8':
         raise NotImplementedError(
@@ -244,17 +342,31 @@ def main():
             f'the ONNX model in --onnx declares {num_inputs} inputs, which looks like it was '
             f'exported with export_onnx.py --bake-ksigma -- pass --bake-ksigma here too'
         )
+    num_outputs = len(sess.get_outputs())
+    if args.jdd and num_outputs != 2:
+        raise ValueError(
+            f'--jdd was passed but the ONNX model in --onnx only declares {num_outputs} '
+            f'output(s) -- it was not exported with export_onnx.py --jdd'
+        )
+    if not args.jdd and num_outputs != 1:
+        raise ValueError(
+            f'the ONNX model in --onnx declares {num_outputs} outputs, which looks like it was '
+            f'exported with export_onnx.py --jdd -- pass --jdd here too'
+        )
 
     ksigma = KSigma(
         K_coeff=[0.0005995267, 0.00868861],
         B_coeff=[7.11772e-7, 6.514934e-4, 0.11492713],
         anchor=1600,
     )
-    denoiser = TiledOnnxDenoiser(sess, args.margin, ksigma, args.dtype, bake_ksigma=args.bake_ksigma)
+    if args.jdd:
+        denoiser = TiledOnnxDemosaicDenoiser(sess, args.margin, ksigma, args.dtype)
+    else:
+        denoiser = TiledOnnxDenoiser(sess, args.margin, ksigma, args.dtype, bake_ksigma=args.bake_ksigma)
 
     full_denoiser = None
     if args.compare_full is not None:
-        full_denoiser = Denoiser(args.compare_full, ksigma)
+        full_denoiser = DemosaicDenoiser(args.compare_full, ksigma) if args.jdd else Denoiser(args.compare_full, ksigma)
 
     args.save_dir.mkdir(parents=True, exist_ok=True)
     bm_loader = BenchmarkLoader(args.benchmark.resolve())
@@ -265,11 +377,19 @@ def main():
         pattern = meta.bayer_pattern
         input_bayer, gt_bayer = RawUtils.to_canonical_rggb(input_bayer, gt_bayer, pattern=pattern)
 
-        pred_bayer, grid_info = denoiser.run(input_bayer, iso=meta.ISO)
+        if args.jdd:
+            pred_bayer, pred_rgb_demosaic, grid_info = denoiser.run(input_bayer, iso=meta.ISO)
+        else:
+            pred_bayer, grid_info = denoiser.run(input_bayer, iso=meta.ISO)
 
         msg = f'{meta.name}  [{grid_info}]'
         if full_denoiser is not None:
-            full_pred_bayer = full_denoiser.run(input_bayer, iso=meta.ISO)
+            if args.jdd:
+                full_pred_bayer, full_pred_rgb_demosaic = full_denoiser.run(input_bayer, iso=meta.ISO)
+                diff_rgb = np.abs(pred_rgb_demosaic.astype(np.float64) - full_pred_rgb_demosaic.astype(np.float64))
+                msg += f'  rgb vs full: max {diff_rgb.max():.3e}, mean {diff_rgb.mean():.3e}'
+            else:
+                full_pred_bayer = full_denoiser.run(input_bayer, iso=meta.ISO)
             diff = np.abs(pred_bayer.astype(np.float64) - full_pred_bayer.astype(np.float64))
             msg += f'  vs full (untiled) PyTorch: max abs diff {diff.max():.3e}, mean abs diff {diff.mean():.3e} (0~1 scale)'
         tqdm.write(msg)
@@ -278,11 +398,19 @@ def main():
             input_bayer, pred_bayer, gt_bayer,
             wb_gain=meta.wb_gain, CCM=meta.CCM,
         )
-        inp_rgb, pred_rgb, gt_rgb = RawUtils.to_canonical_rggb(inp_rgb, pred_rgb, gt_rgb, pattern=pattern)
+        if args.jdd:
+            inp_rgb, pred_rgb, gt_rgb, pred_rgb_demosaic = RawUtils.to_canonical_rggb(
+                inp_rgb, pred_rgb, gt_rgb, pred_rgb_demosaic, pattern=pattern,
+            )
+        else:
+            inp_rgb, pred_rgb, gt_rgb = RawUtils.to_canonical_rggb(inp_rgb, pred_rgb, gt_rgb, pattern=pattern)
 
         save_rgb_png(args.save_dir / f'{meta.name}_input.png', inp_rgb)
         save_rgb_png(args.save_dir / f'{meta.name}_pred.png', pred_rgb)
         save_rgb_png(args.save_dir / f'{meta.name}_gt.png', gt_rgb)
+        if args.jdd:
+            save_rgb_png(args.save_dir / f'{meta.name}_pred_demosaic.png',
+                         demosaic_rgb_to_display(pred_rgb_demosaic))
 
         pred_bayer_orig_pattern = RawUtils.to_canonical_rggb(pred_bayer, pattern=pattern)
         save_bayer_raw(args.save_dir / f'{meta.name}_pred.raw', pred_bayer_orig_pattern, meta.raw_bitWidth)

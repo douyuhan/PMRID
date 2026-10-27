@@ -9,7 +9,7 @@ import numpy as np
 import skimage.metrics
 from tqdm import tqdm
 
-from models.net_torch import Network
+from models.net_torch import Network, NetworkDemosaic
 from utils import RawUtils, round_half_up
 from dataset.benchmark import BenchmarkLoader, RawMeta
 
@@ -90,6 +90,76 @@ class Denoiser:
         return RawUtils.rggb2bayer(pred)
 
 
+def demosaic_rgb_to_display(rgb_01: np.ndarray, gamma: float = 2.2) -> np.ndarray:
+    """Converts NetworkDemosaic's direct full-resolution rgb output to a displayable
+    image. Unlike RawUtils.bayer2rgb's real-sensor pipeline, this does NOT apply white
+    balance or a CCM: the demosaic head (see models/net_torch.py::NetworkDemosaic,
+    train_JDD_pytorch.py) was trained only on Phase-1 synthetic data -- ordinary public
+    sRGB photos, approximately inverse-gamma'd into "linear" domain (see
+    dataset/synthetic_mosaic.py) -- which are already "a normal photo's colors," not raw
+    sensor response needing WB/CCM correction. Applying bayer2rgb's WB/CCM step to this
+    output would be wrong, not just redundant. Feeding this to genuinely real sensor raw
+    will visibly mis-color the result -- a known, documented Phase 1 limitation (the
+    demosaic head has never seen real sensor raw), not a bug in this function."""
+    return np.clip(rgb_01, 0, 1) ** (1 / gamma)
+
+
+class DemosaicDenoiser:
+    """Like Denoiser, but wraps NetworkDemosaic and also returns its direct
+    full-resolution rgb demosaic output (KSigma-denormalized, [0,1]-ish linear domain,
+    not yet gamma'd for display -- see demosaic_rgb_to_display)."""
+
+    def __init__(self, model_path: Path, ksigma: KSigma, inp_scale=256.0, device='cpu'):
+        net = NetworkDemosaic()
+        state_dict = torch.load(str(model_path), map_location=device)
+        net.load_state_dict(state_dict)  # strict=True: a fully-trained JDD checkpoint
+        # already has every key (unlike NetworkDemosaic.from_pretrained, which is for
+        # loading a plain denoise-only checkpoint into a freshly-initialized demosaic head)
+        net.eval()
+
+        self.device = torch.device(device)
+        self.net = net.to(self.device)
+        self.ksigma = ksigma
+        self.inp_scale = inp_scale
+
+    def pre_process(self, bayer_01: np.ndarray):
+        # identical to Denoiser.pre_process -- see that method's comments for why
+        # reflect-padding (not zero-padding) by an even raw-pixel amount is needed
+        H, W = bayer_01.shape
+        ph, pw = (32-((H//2) % 32))//2, (32-((W//2) % 32))//2
+        bayer_01 = np.pad(bayer_01, [(2*ph, 2*ph), (2*pw, 2*pw)], mode='reflect')
+
+        rggb = RawUtils.bayer2rggb(bayer_01)
+        rggb = rggb.clip(0, 1)
+        inp_rggb = rggb.transpose(2, 0, 1)[np.newaxis]
+        self.ph, self.pw = ph, pw
+        return inp_rggb
+
+    def run(self, bayer_01: np.ndarray, iso: float):
+        inp_rggb_01 = self.pre_process(bayer_01)
+        inp_rggb = self.ksigma(inp_rggb_01, iso) * self.inp_scale
+
+        inp = np.ascontiguousarray(inp_rggb, dtype=np.float32)
+        with torch.no_grad():
+            inp_t = torch.from_numpy(inp).to(self.device)
+            pred_rggb_t, pred_rgb_t = self.net(inp_t)
+            pred_rggb = (pred_rggb_t[0] / self.inp_scale).cpu().numpy().transpose(1, 2, 0)
+            pred_rgb_full = (pred_rgb_t[0] / self.inp_scale).cpu().numpy().transpose(1, 2, 0)
+        # same per-frame KSigma affine denormalizes both outputs -- DataAug.transform
+        # applied the identical forward affine to both the RGGB and RGB ground truth
+        # during training, so the inverse here must match for both too
+        pred_rggb = self.ksigma(pred_rggb, iso, inverse=True)
+        pred_rgb_full = self.ksigma(pred_rgb_full, iso, inverse=True)
+
+        ph, pw = self.ph, self.pw
+        pred_rggb = pred_rggb[ph:-ph, pw:-pw]
+        # rgb is at 2x the RGGB-plane resolution, i.e. exactly the padded raw-pixel
+        # resolution -- so it needs the same 2*ph/2*pw crop pre_process padded by,
+        # not the ph/pw crop the (half-resolution) RGGB output uses
+        pred_rgb_full = pred_rgb_full[2*ph:-2*ph, 2*pw:-2*pw]
+        return RawUtils.rggb2bayer(pred_rggb), pred_rgb_full
+
+
 def save_rgb_png(path: Path, rgb_01: np.ndarray):
     bgr_uint8 = round_half_up(rgb_01.clip(0, 1)[..., ::-1] * 255).astype(np.uint8)
     cv2.imwrite(str(path), bgr_uint8)
@@ -102,14 +172,23 @@ def save_bayer_raw(path: Path, bayer_01: np.ndarray, bitWidth: int):
     bayer_uint16.tofile(str(path))
 
 
-def run_benchmark(model_path, bm_loader: BenchmarkLoader, save_dir: Path = None):
+def run_benchmark(model_path, bm_loader: BenchmarkLoader, save_dir: Path = None, jdd: bool = False):
 
     ksigma = KSigma(
         K_coeff=[0.0005995267, 0.00868861],
         B_coeff=[7.11772e-7, 6.514934e-4, 0.11492713],
         anchor=1600,
     )
-    denoiser = Denoiser(model_path, ksigma)
+    denoiser = DemosaicDenoiser(model_path, ksigma) if jdd else Denoiser(model_path, ksigma)
+    if jdd:
+        print(
+            "--jdd: additionally saving {name}_pred_demosaic.png (the network's direct "
+            "demosaic output). No PSNR/SSIM is computed for it -- it isn't in the same "
+            "color space as this benchmark's WB+CCM'd GT (see demosaic_rgb_to_display's "
+            "docstring), and on real sensor raw it's expected to look visibly off-color "
+            "(known Phase 1 limitation, not a bug). The PSNR/SSIM below is still the "
+            "denoise branch only, computed exactly as without --jdd."
+        )
 
     if save_dir is not None:
         save_dir.mkdir(parents=True, exist_ok=True)
@@ -126,13 +205,21 @@ def run_benchmark(model_path, bm_loader: BenchmarkLoader, save_dir: Path = None)
         # converts back (canonical -> original)
         input_bayer, gt_bayer = RawUtils.to_canonical_rggb(input_bayer, gt_bayer, pattern=pattern)
 
-        pred_bayer = denoiser.run(input_bayer, iso=meta.ISO)
+        if jdd:
+            pred_bayer, pred_rgb_demosaic = denoiser.run(input_bayer, iso=meta.ISO)
+        else:
+            pred_bayer = denoiser.run(input_bayer, iso=meta.ISO)
 
         inp_rgb, pred_rgb, gt_rgb = RawUtils.bayer2rgb(
             input_bayer, pred_bayer, gt_bayer,
             wb_gain=meta.wb_gain, CCM=meta.CCM,
         )
-        inp_rgb, pred_rgb, gt_rgb = RawUtils.to_canonical_rggb(inp_rgb, pred_rgb, gt_rgb, pattern=pattern)
+        if jdd:
+            inp_rgb, pred_rgb, gt_rgb, pred_rgb_demosaic = RawUtils.to_canonical_rggb(
+                inp_rgb, pred_rgb, gt_rgb, pred_rgb_demosaic, pattern=pattern,
+            )
+        else:
+            inp_rgb, pred_rgb, gt_rgb = RawUtils.to_canonical_rggb(inp_rgb, pred_rgb, gt_rgb, pattern=pattern)
         bar.set_description(meta.name+' ✓')
 
         if save_dir is not None:
@@ -140,6 +227,9 @@ def run_benchmark(model_path, bm_loader: BenchmarkLoader, save_dir: Path = None)
             save_rgb_png(save_dir / f'{meta.name}_input.png', inp_rgb)
             save_rgb_png(save_dir / f'{meta.name}_pred.png', pred_rgb)
             save_rgb_png(save_dir / f'{meta.name}_gt.png', gt_rgb)
+            if jdd:
+                save_rgb_png(save_dir / f'{meta.name}_pred_demosaic.png',
+                             demosaic_rgb_to_display(pred_rgb_demosaic))
 
             # denoised bayer raw, flipped back to the sample's original bayer_pattern
             # and rescaled to the same raw_bitWidth range as the input/gt files
@@ -179,11 +269,19 @@ def main():
         help='directory to save input/pred/gt RGB visualizations (png, full image) '
              'and the denoised bayer output (.raw, restored to the original bayer_pattern)',
     )
+    parser.add_argument(
+        '--jdd', action='store_true',
+        help="model is a models/net_torch.py::NetworkDemosaic checkpoint (e.g. from "
+             "train_JDD_pytorch.py), not a plain denoise-only Network. Denoise PSNR/SSIM "
+             "is computed exactly as without this flag; additionally saves "
+             "{name}_pred_demosaic.png from the network's own demosaic output (see "
+             "demosaic_rgb_to_display for why this has no PSNR/SSIM and no WB/CCM).",
+    )
 
     args = parser.parse_args()
 
     bm_loader = BenchmarkLoader(args.benchmark.resolve())
-    run_benchmark(args.model, bm_loader, save_dir=args.save_dir)
+    run_benchmark(args.model, bm_loader, save_dir=args.save_dir, jdd=args.jdd)
 
 
 if __name__ == "__main__":
