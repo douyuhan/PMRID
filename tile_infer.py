@@ -300,15 +300,34 @@ def main():
         help="--onnx is a 2-output export_onnx.py --jdd graph (NetworkDemosaic: denoise + "
              "demosaic), not a plain 1-output denoise-only graph. Not combinable with "
              "--bake-ksigma (export_onnx.py --jdd doesn't support it). Additionally saves "
-             "{name}_pred_demosaic.png from the network's own demosaic output -- see "
-             "run_benchmark_pytorch.py's demosaic_rgb_to_display for why this has no "
-             "PSNR/SSIM and no WB/CCM, and is expected to look off-color on real sensor raw.",
+             "{name}_pred_demosaic.png from the network's own demosaic output, always "
+             "passed through CCM+gamma, plus WB if --wb-mode is not 'none' -- see "
+             "run_benchmark_pytorch.py's demosaic_rgb_to_display for why this still has no "
+             "PSNR/SSIM, and is expected to look off-color on real sensor raw with "
+             "--wb-mode none.",
+    )
+    parser.add_argument(
+        '--wb-mode', type=str, default='none', choices=['none', 'output', 'input'],
+        help="--jdd only; experimental diagnostic for the demosaic branch's color-cast "
+             "issue (see doc_draft/PMRID_JDD_plan_phase3_demosaic_wb.md 方案1/方案2 -- "
+             "NEITHER is the recommended long-term fix, both are quick checks on the "
+             "already-trained epoch_best_13.ckp). "
+             "'none' (default): current behavior, no WB applied anywhere near the network. "
+             "'output' (方案1): multiply the demosaic branch's rgb output by meta.wb_gain "
+             "right after KSigma-denormalization, before display gamma -- does not touch "
+             "the denoise branch or the network input at all. "
+             "'input' (方案2): apply meta.wb_gain to the raw bayer (RawUtils.apply_wb) "
+             "*before* feeding it to the network -- affects BOTH heads (shared input), "
+             "expected to also perturb denoise quality since the denoise branch was never "
+             "trained on WB'd input.",
     )
     args = parser.parse_args()
 
     if args.jdd and args.bake_ksigma:
         raise ValueError('--jdd does not support --bake-ksigma (export_onnx.py --jdd never '
                           'produces that combination) -- drop one of the two flags.')
+    if args.wb_mode != 'none' and not args.jdd:
+        raise ValueError('--wb-mode only applies to the demosaic branch of a --jdd model')
 
     if args.dtype == 'int8':
         raise NotImplementedError(
@@ -377,27 +396,47 @@ def main():
         pattern = meta.bayer_pattern
         input_bayer, gt_bayer = RawUtils.to_canonical_rggb(input_bayer, gt_bayer, pattern=pattern)
 
+        # --wb-mode input (方案2): WB the raw *before* it reaches the network -- affects
+        # both heads, since they share this one input tensor. input_bayer itself is left
+        # untouched so the saved {name}_input.png visualization stays representative of
+        # the true scene, not this experiment's WB-boosted network input.
+        net_input_bayer = input_bayer
+        if args.wb_mode == 'input':
+            net_input_bayer = RawUtils.apply_wb(input_bayer, meta.wb_gain)
+
         if args.jdd:
-            pred_bayer, pred_rgb_demosaic, grid_info = denoiser.run(input_bayer, iso=meta.ISO)
+            pred_bayer, pred_rgb_demosaic, grid_info = denoiser.run(net_input_bayer, iso=meta.ISO)
+            # --wb-mode output (方案1): WB only the demosaic branch's own rgb output,
+            # after KSigma-denormalization (linear domain) and before display gamma --
+            # does not touch pred_bayer/denoise at all.
+            if args.wb_mode == 'output':
+                pred_rgb_demosaic = pred_rgb_demosaic * np.array(meta.wb_gain)[None, None, :]
         else:
-            pred_bayer, grid_info = denoiser.run(input_bayer, iso=meta.ISO)
+            pred_bayer, grid_info = denoiser.run(net_input_bayer, iso=meta.ISO)
 
         msg = f'{meta.name}  [{grid_info}]'
         if full_denoiser is not None:
             if args.jdd:
-                full_pred_bayer, full_pred_rgb_demosaic = full_denoiser.run(input_bayer, iso=meta.ISO)
+                full_pred_bayer, full_pred_rgb_demosaic = full_denoiser.run(net_input_bayer, iso=meta.ISO)
+                if args.wb_mode == 'output':
+                    full_pred_rgb_demosaic = full_pred_rgb_demosaic * np.array(meta.wb_gain)[None, None, :]
                 diff_rgb = np.abs(pred_rgb_demosaic.astype(np.float64) - full_pred_rgb_demosaic.astype(np.float64))
                 msg += f'  rgb vs full: max {diff_rgb.max():.3e}, mean {diff_rgb.mean():.3e}'
             else:
-                full_pred_bayer = full_denoiser.run(input_bayer, iso=meta.ISO)
+                full_pred_bayer = full_denoiser.run(net_input_bayer, iso=meta.ISO)
             diff = np.abs(pred_bayer.astype(np.float64) - full_pred_bayer.astype(np.float64))
             msg += f'  vs full (untiled) PyTorch: max abs diff {diff.max():.3e}, mean abs diff {diff.mean():.3e} (0~1 scale)'
         tqdm.write(msg)
 
-        inp_rgb, pred_rgb, gt_rgb = RawUtils.bayer2rgb(
-            input_bayer, pred_bayer, gt_bayer,
-            wb_gain=meta.wb_gain, CCM=meta.CCM,
-        )
+        # pred_bayer's own WB state depends on wb_mode: under 'input', the network ran on
+        # an already-WB'd raw (net_input_bayer above), so its residual output is already
+        # in WB'd domain -- applying meta.wb_gain again here would double-WB it (this is
+        # what made the denoise branch's pred.png look purple under --wb-mode input).
+        # input_bayer/gt_bayer are always the untouched original raw, so they always need
+        # the real wb_gain regardless of wb_mode.
+        pred_wb_gain = (1.0, 1.0, 1.0) if args.wb_mode == 'input' else meta.wb_gain
+        inp_rgb, gt_rgb = RawUtils.bayer2rgb(input_bayer, gt_bayer, wb_gain=meta.wb_gain, CCM=meta.CCM)
+        pred_rgb = RawUtils.bayer2rgb(pred_bayer, wb_gain=pred_wb_gain, CCM=meta.CCM)
         if args.jdd:
             inp_rgb, pred_rgb, gt_rgb, pred_rgb_demosaic = RawUtils.to_canonical_rggb(
                 inp_rgb, pred_rgb, gt_rgb, pred_rgb_demosaic, pattern=pattern,
@@ -409,8 +448,17 @@ def main():
         save_rgb_png(args.save_dir / f'{meta.name}_pred.png', pred_rgb)
         save_rgb_png(args.save_dir / f'{meta.name}_gt.png', gt_rgb)
         if args.jdd:
+            # demosaic_rgb_to_display always applies CCM (see its docstring in
+            # run_benchmark_pytorch.py) so the demosaic branch's saved PNG goes through
+            # the same denoise+WB+demosaic+ccm+gamma module set as the denoise branch's
+            # pred.png for every wb_mode except 'none' (which deliberately has no WB
+            # anywhere, by design -- see doc_draft/PMRID_JDD_plan_phase3_demosaic_wb.md).
+            # wb_gain is NOT passed here: 'output' mode already multiplied
+            # pred_rgb_demosaic by meta.wb_gain above (before this call), and 'input'
+            # mode's network output is already in WB'd domain from its WB'd input --
+            # passing wb_gain here too would double-apply it in both cases.
             save_rgb_png(args.save_dir / f'{meta.name}_pred_demosaic.png',
-                         demosaic_rgb_to_display(pred_rgb_demosaic))
+                         demosaic_rgb_to_display(pred_rgb_demosaic, CCM=meta.CCM))
 
         pred_bayer_orig_pattern = RawUtils.to_canonical_rggb(pred_bayer, pattern=pattern)
         save_bayer_raw(args.save_dir / f'{meta.name}_pred.raw', pred_bayer_orig_pattern, meta.raw_bitWidth)

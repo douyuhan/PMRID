@@ -105,6 +105,18 @@ class RawUtils:
         return np.stack([r, g_tr, g_bl, b], axis=-1)
 
     @classmethod
+    def apply_wb(cls, bayer_01, wb_gain):
+        """Applies a raw-domain WB gain directly to a canonical-RGGB-oriented bayer
+        array (same [R,G,G,B] channel expansion -- wb_gain[[0,1,1,2]] -- bayer2rgb
+        already uses internally for its own WB step), returning a bayer array of the
+        same shape. Exposed standalone (rather than only inline inside bayer2rgb) for
+        experiments that need WB applied to the raw input *before* it reaches a
+        network, not just before the visualization demosaic -- see tile_infer.py's
+        --wb-mode input."""
+        wb_gain = np.array(wb_gain)[[0, 1, 1, 2]]
+        return cls.rggb2bayer((cls.bayer2rggb(bayer_01) * wb_gain).clip(0, 1))
+
+    @classmethod
     def bayer2rgb(cls, *bayer_01s, wb_gain, CCM, gamma=2.2):
 
         wb_gain = np.array(wb_gain)[[0, 1, 1, 2]]
