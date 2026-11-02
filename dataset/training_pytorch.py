@@ -55,6 +55,25 @@ non-negative): confirmed the same mosaic's structure becomes visible again, with
 diff vs. the clean mosaic dropping ~13x (1.47e-1 -> 1.14e-2 on a [0,1] scale, ISO 3200).
 This clamp is present identically in dataset/training.py (`.clip(0, 1)`, same line) --
 confirmed to predate this port, not introduced by it.
+
+Found later, JDD-only (this file only, not dataset/training.py): Phase 3 Option 5
+(doc_draft/PMRID_JDD_plan_phase3_demosaic_wb.md 方案5) -- retraining NetworkDemosaic so
+"WB'd raw" is the network's input convention, instead of leaving the demosaic head's input
+WB-imbalanced relative to what its (implicitly-already-WB'd) synthetic training photos
+looked like. DataAugOptions gained an opt-in `wb_gain_range` field (default None, i.e.
+disabled -- train_pytorch.py/train_qat_pytorch.py never set it, so their DataAug.transform
+calls are numerically identical to before: multiplying by the resulting all-ones gain is an
+exact float32 no-op). When set (by train_JDD_pytorch.py only), DataAug.transform applies a
+random per-sample [r_gain, 1, 1, b_gain] WB multiply to both the noisy and clean RGGB
+tensors, placed *after* add_noise (native, unWB'd scale) and *before* the cvt_k/cvt_b KSigma
+affine -- so noise is still synthesized on the physically-correct native magnitude, and
+cvt_b (a KSigma-domain normalization constant, not a per-channel raw signal) is never itself
+scaled by WB gain. The real-raw branch (CleanRawImages, already native/unWB'd) samples this
+gain fresh inside transform() itself; the synthetic branch (SyntheticMosaicImages) must
+instead *supply* the exact same gain it already used for an earlier, necessary step (see
+dataset/synthetic_mosaic.py) -- transform() takes this as the new optional `batch_wb_gain`
+parameter, sampling its own only when not given. batch_rgb01 (the demosaic RGB ground
+truth) is deliberately left untouched by this change -- see that file's docstring for why.
 """
 import json
 import math
@@ -102,6 +121,10 @@ class DataAugOptions:
     output_shape: Tuple[int, int] = (512, 512)   # 512x512x4
     target_brighness_range: Tuple[float, float] = (0.02, 0.5)
     inp_scale: float = 256.0
+    # Phase 3 Option 5 (JDD-only, see module docstring): ((r_lo, r_hi), (b_lo, b_hi)) random
+    # WB gain range applied by DataAug.transform. None (default) disables it entirely --
+    # train_pytorch.py/train_qat_pytorch.py never set this field.
+    wb_gain_range: Optional[Tuple[Tuple[float, float], Tuple[float, float]]] = None
 
     @staticmethod
     def parse_file(path) -> "DataAugOptions":
@@ -222,7 +245,8 @@ class DataAug:
         self.noise_func = NoiseProfileFunc(opts.noise_profile)
         self.device = torch.device(device)
 
-    def transform(self, batch_img01: torch.Tensor, batch_g_mean, batch_rgb01: torch.Tensor = None):
+    def transform(self, batch_img01: torch.Tensor, batch_g_mean, batch_rgb01: torch.Tensor = None,
+                  batch_wb_gain: np.ndarray = None):
         """
         Args:
             - batch_img01: (N, 4, H, W) float32 tensor, clean RGGB in [0, 1] (as returned
@@ -235,7 +259,16 @@ class DataAug:
               all). When given, it is carried through the *same* brightness/KSigma/
               inp_scale affine chain as batch_gt (so a demosaic loss against it is
               consistent with the denoise loss's domain) but never has noise added, since
-              it's the demosaic target, not a noisy input.
+              it's the demosaic target, not a noisy input. Deliberately NEVER touched by
+              wb_gain_tensor below -- see dataset/synthetic_mosaic.py's docstring for why
+              the demosaic RGB target doesn't need (and must not get) the WB round trip.
+            - batch_wb_gain: Phase 3 Option 5 only (self.opts.wb_gain_range set -- see
+              module docstring); optional (N, 2) array of [r_gain, b_gain] already sampled
+              by the caller. Required for the synthetic branch (must match the gain
+              SyntheticMosaicImages already used for its own pre-mosaic inv-WB step);
+              left None for the real-raw branch, which has no such earlier step and gets a
+              freshly-sampled gain here instead. Ignored (effectively all-ones) when
+              self.opts.wb_gain_range is None.
 
         Returns:
             - noisy_img (network input)
@@ -247,6 +280,15 @@ class DataAug:
         batch_gt, brightness_scale = self.brightness_aug(batch_imgs, batch_g_mean)
         batch_imgs, batch_iso = self.add_noise(batch_gt)
         cvt_k, cvt_b = self.k_sigma(batch_iso)
+
+        # Phase 3 Option 5 (JDD-only, see module docstring): WB is applied here -- after
+        # noise synthesis (so noise is still synthesized on the physically-correct native,
+        # unWB'd magnitude), before the KSigma affine (so cvt_b, a KSigma-domain
+        # normalization constant rather than a per-channel raw signal, is never itself
+        # scaled by WB gain). A no-op (all-ones) when self.opts.wb_gain_range is None.
+        wb_gain = self.wb_gain_tensor(batch_wb_gain, N=batch_imgs.shape[0])
+        batch_imgs = batch_imgs * wb_gain
+        batch_gt = batch_gt * wb_gain
 
         batch_imgs = batch_imgs * cvt_k + cvt_b
         batch_gt = batch_gt * cvt_k + cvt_b
@@ -267,6 +309,27 @@ class DataAug:
         batch_rgb = batch_rgb * cvt_k + cvt_b
         batch_rgb = batch_rgb / self.opts.camera_value_scale * self.opts.inp_scale
         return batch_imgs, batch_gt, cvt_k, batch_rgb
+
+    def sample_wb_gain(self, N: int) -> np.ndarray:
+        """(N, 2) array of [r_gain, b_gain] per sample, uniform over
+        self.opts.wb_gain_range; all-ones (no-op) when that option is None."""
+        if self.opts.wb_gain_range is None:
+            return np.ones((N, 2), dtype=np.float32)
+        (r_lo, r_hi), (b_lo, b_hi) = self.opts.wb_gain_range
+        r = np.random.uniform(r_lo, r_hi, size=(N,)).astype(np.float32)
+        b = np.random.uniform(b_lo, b_hi, size=(N,)).astype(np.float32)
+        return np.stack([r, b], axis=-1)
+
+    def wb_gain_tensor(self, batch_wb_gain, N: int) -> torch.Tensor:
+        """Expands a (N, 2) [r_gain, b_gain] array (sampling a fresh one via
+        sample_wb_gain when batch_wb_gain is None) into an (N, 4, 1, 1) per-channel
+        [R, Gr, Gb, B] gain tensor -- the same wb_gain[[0, 1, 1, 2]] expansion
+        RawUtils.apply_wb/bayer2rgb use elsewhere, just batched."""
+        if batch_wb_gain is None:
+            batch_wb_gain = self.sample_wb_gain(N)
+        gain = torch.as_tensor(batch_wb_gain, dtype=torch.float32, device=self.device)
+        ones = torch.ones_like(gain[:, :1])
+        return torch.cat([gain[:, :1], ones, ones, gain[:, 1:2]], dim=1).reshape(-1, 4, 1, 1)
 
     def k_sigma(self, iso: np.ndarray) -> Tuple[torch.Tensor, torch.Tensor]:
         k, sigma = self.noise_func(iso, value_scale=self.opts.camera_value_scale)

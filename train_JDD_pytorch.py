@@ -19,6 +19,18 @@ alternated every step, same as discussed in the design:
 Shares add_data_aug_args/build_data_aug_options/get_loss_l1 with train_pytorch.py (same
 Reno 10x sensor-calibration defaults), and the best-checkpoint tracking pattern
 (epoch_best_{epoch}.ckp, previous best deleted) from train_qat_pytorch.py.
+
+Phase 3 Option 5 (doc_draft/PMRID_JDD_plan_phase3_demosaic_wb.md 方案5): this script always
+trains under the "WB'd raw" input convention -- --wb-r-gain-range/--wb-b-gain-range (not
+part of the shared add_data_aug_args, since they're JDD/demosaic-specific, not a general
+PMRID denoise option) set dataset/training_pytorch.py::DataAugOptions.wb_gain_range, which
+makes DataAug.transform apply a random per-sample WB gain to both branches (see that
+file's and dataset/synthetic_mosaic.py's docstrings for the full real-raw/synthetic
+pipeline design and why each needs different handling). Default ranges ([1.0, 3.0] for both
+R and B) comfortably cover dataset/benchmark's and dataset/test's real wb_gain values (see
+the doc). Pass identical lo/hi values (e.g. "--wb-r-gain-range 1.0 1.0 --wb-b-gain-range
+1.0 1.0") to effectively disable this and reproduce the Phase 1/2 unWB'd-native convention
+instead.
 """
 import argparse
 import json
@@ -146,6 +158,17 @@ def main():
                          help='denoise-only checkpoint to initialize the shared trunk from')
     parser.add_argument('--demosaic-weight', type=float, default=1.0,
                          help='weight of the demosaic L1 loss relative to the denoise L1 loss, on synthetic batches')
+    parser.add_argument('--wb-r-gain-range', nargs=2, type=float, default=[1.0, 3.0],
+                         help='Phase 3 Option 5: random per-sample R-channel WB gain range '
+                              'applied to the network\'s raw input (both branches) and clean '
+                              'RGGB target -- see module docstring. Widened to 1.0-3.0 to '
+                              'comfortably cover the measured real wb_gain ranges '
+                              '(dataset/benchmark ~1.35-1.67, dataset/test ~1.54-2.18).')
+    parser.add_argument('--wb-b-gain-range', nargs=2, type=float, default=[1.0, 3.0],
+                         help='Phase 3 Option 5: same as --wb-r-gain-range, B channel. '
+                              'Widened to 1.0-3.0 to comfortably cover the measured real '
+                              'wb_gain ranges (dataset/benchmark ~2.15-2.49, dataset/test '
+                              '~1.99-2.80).')
     parser.add_argument('--batch-size', default=4, type=int)
     parser.add_argument('--ckp-dir', default=Path('models/checkpoints_demosaic'), type=Path)
     parser.add_argument('--learning-rate', dest='lr', default=1e-5, type=float,
@@ -186,6 +209,10 @@ def main():
     optimizer = optim.Adam(net.parameters(), lr=args.lr)
 
     aug_opts = build_data_aug_options(args)
+    # Phase 3 Option 5 (see module docstring): not part of the shared
+    # add_data_aug_args/build_data_aug_options (those stay JDD-agnostic), so set directly
+    # on the returned dataclass instance.
+    aug_opts.wb_gain_range = (tuple(args.wb_r_gain_range), tuple(args.wb_b_gain_range))
     train_aug = DataAug(aug_opts, device=device)
 
     real_ds = CleanRawImages(data_dir=args.real_data_dir, opts=aug_opts)
@@ -213,8 +240,8 @@ def main():
             optimizer.step()
 
             # --- synthetic sRGB: denoise loss + demosaic loss ---
-            imgs, g_means, rgb01 = synth_batch
-            noisy, gt_rggb, norm_k, gt_rgb = train_aug.transform(imgs, g_means, rgb01)
+            imgs, g_means, rgb01, wb_gain = synth_batch
+            noisy, gt_rggb, norm_k, gt_rgb = train_aug.transform(imgs, g_means, rgb01, wb_gain)
             optimizer.zero_grad()
             pred_rggb, pred_rgb = net(noisy)
             loss_denoise = get_loss_l1(pred_rggb, gt_rggb, norm_k)

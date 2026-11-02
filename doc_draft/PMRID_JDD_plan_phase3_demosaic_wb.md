@@ -243,3 +243,56 @@ denoise"策略，synthetic数据的"干净信号"已经被别的相机处理过�
 `dataset/test/meta_info.json`（每条都带真实`wb_gain`/`CCM`）跑一遍完整`BenchmarkLoader`，确认
 0条warning触发（没有误伤正常数据）；`run_benchmark_pytorch.py --jdd`在该数据集上的mean PSNR/SSIM
 和改动前完全一致（31.386dB / 0.892），确认这个改动对现有数据集零影响，只在缺字段时起兜底作用。
+
+## 补充：方案5训练数据管线已实现、第一轮完整训练已完成（`JDD_WB`分支）
+
+在`JDD_WB`分支（从方案1/2实验完成的commit切出）上实现了方案5的训练数据部分，细节见
+`CLAUDE.md`"JDD Phase 3, Option 5 implementation"一节，这里只记录状态：
+
+- **`dataset/training_pytorch.py::DataAugOptions`新增`wb_gain_range`字段**（默认`None`=关闭，
+  `train_pytorch.py`/`train_qat_pytorch.py`不设置这个字段，行为完全不变——乘以全1 gain是精确的
+  float32 no-op）。`DataAug.transform`在`add_noise`之后、`cvt_k`/`cvt_b`之前对noisy和clean两个
+  tensor都乘一次随机WB gain（`[r,1,1,b]`展开），顺序是刻意选择的：噪声仍在物理正确的原生（未WB）
+  量级上合成，且`cvt_b`（KSigma域的归一化常数，不是per-channel的raw信号）不会被WB gain污染。
+- **real raw分支**（`CleanRawImages`）在`transform()`内部直接采样新的随机gain（它没有mosaic前的
+  步骤需要配合）；**synthetic分支**（`SyntheticMosaicImages`）在`__getitem__`里采样gain、对crop做
+  inv WB再mosaic，并把这个gain原样通过新增的第4个返回值传给`transform()`的WB-加回去步骤（不能
+  在`transform()`里重新采样一个新值，必须是同一个）——`rgb01`（demosaic GT）保持不受inv WB影响
+  （对干净信号这个往返是精确抵消的，GT不需要变）。
+- **默认gain范围**（`train_JDD_pytorch.py --wb-r-gain-range`/`--wb-b-gain-range`）：R、B两个通道
+  都统一设成`[1.0,3.0]`（用户明确要求，覆盖本文档前面实测的`dataset/benchmark`（R 1.35~1.67，
+  B 2.15~2.49）和`dataset/test`（R 1.54~2.18，B 1.99~2.80）两个真实范围并留出余量，代价是也会
+  采样到比实测范围更宽的gain组合）。
+- **推理侧意外发现：不需要新代码**——方案1/2诊断实验里加的`--wb-mode input`，本身已经是"在raw送入
+  网络前做WB、且不给已经WB过的denoise分支结果二次WB"的完整实现，和方案5要求的推理pipeline改动
+  完全一致，只是当时是套在一个"没见过WB输入"的checkpoint上做诊断。等方案5的checkpoint训练出来，
+  直接用`tile_infer.py --jdd --wb-mode input`/`run_benchmark_pytorch.py --jdd --wb-mode input`
+  应该就是对的推理方式，不需要再改`wb_mode`的任何分支逻辑——这一点目前只是代码审查层面确认，还没有
+  拿真实的方案5 checkpoint跑过验证。
+- **已验证**（代码正确性，不是训练效果）：`DataAug.transform`的WB位置与手算期望值数值核对一致，
+  `wb_gain_range=None`时精确复现旧的无WB行为；`SyntheticMosaicImages`的inv-WB+mosaic+gain透传与
+  手算期望值数值核对一致，关闭时gain精确为`[1,1]`；2 epoch冒烟测试（`dataset/SID_Sony_raw` +
+  Phase 1用过的同一批42张Kodak24/McMaster图，`--output-shape 256 256`）无报错，loss有限，存下的
+  checkpoint能`strict=True`加载进`NetworkDemosaic()`。
+- **第一轮完整训练已完成**：`models/checkpoints_jdd_wb/`（新目录，和Phase1/2的`models/checkpoints_jdd/`
+  分开），从`torch_pretrained.ckp`热启动（不是`epoch_best_13.ckp`——两个现有checkpoint其实都是在
+  原生未WB的raw上训练的，`epoch_best_13.ckp`的demosaic头本身也是在"错的"domain假设下学出来的，复用
+  它收益存疑，还要绕开`from_pretrained()`的强校验，所以选了风险更低、零新代码的`torch_pretrained.ckp`
+  路径），`dataset/SID_Sony_raw`+`dataset/train_JDD`（和Phase1/2同一批数据），`--batch-size 1`、
+  `--learning-rate 1e-5`、`--num-epoch 20`，这次一次性跑完没有中断（约10小时）。**最优checkpoint：
+  `epoch_best_14.ckp`**（loss 4.1137）。
+- **`run_benchmark_pytorch.py --jdd --wb-mode input`评估结果**（`dataset/test`的8张真实样本，暂时
+  没走export onnx/tile infer）：denoise分支 **mean PSNR 32.50dB / SSIM 0.903**——比Phase1/2的
+  `epoch_best_13.ckp`在它自己的原生domain下跑出的基线（31.39dB/0.892）还要好。目视检查：停车场样本
+  的`_pred_demosaic.png`偏绿问题已经看不出来，色彩和`_pred.png`很接近；夜空样本的平坦区域两个分支
+  噪声都很干净，没有复现方案2诊断实验里那种去噪质量下降；白/蓝指示牌边缘的伪色程度和denoise分支自己
+  的cv2 demosaic基线相当，没有复现方案1诊断实验里那种伪色加重。也就是说，方案5看起来确实做到了"治好
+  偏色，同时不用承担方案1/方案2各自的那个代价"。
+- **`epoch_history.csv`趋势**：总loss前8个epoch快速下降（4.85→4.19），之后在4.11~4.31之间震荡到
+  epoch19，没有再系统性下降（典型的batch_size=1 SGD噪声平台期）。拆开看：real/synth denoise大约
+  epoch5~9之后就不再有系统性改善；但demosaic这一项还在持续下降，一直到epoch18（0.753→0.577）才算
+  见底，epoch19又略微回弹——说明这一轮结束时，denoise已经到平台期，demosaic还有压缩空间。
+- **当前进展（续训中）**：按用户要求，没有简单地原样再训练而是把`--demosaic-weight`从默认1.0调到
+  2.0（epoch20起，`--num-epoch 35`，`--auto-resume`从`epoch_19.ckp`续训，`best_loss`/`best_epoch`
+  记录正确带过来），其余超参（学习率、batch size）保持不变，刻意只改这一个变量，方便把demosaic
+  loss如果真的压下去的效果和这个改动对应上。截至目前还在跑，尚未评估结果。

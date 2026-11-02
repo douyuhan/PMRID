@@ -18,6 +18,24 @@ needed here: that trick exists because CleanRawImages crops/flips an array that 
 position). Here the crop/flip happens on the full RGB image, before mosaicking, so
 RawUtils.rgb_to_mosaic_rggb always samples at a fixed phase (top-left = R) and the
 result is canonical RGGB regardless of which flip was applied.
+
+Phase 3 Option 5 (doc_draft/PMRID_JDD_plan_phase3_demosaic_wb.md 方案5, opts.wb_gain_range
+set -- see dataset/training_pytorch.py's module docstring): these source photos are
+*already* "implicitly WB'd" (ordinary processed sRGB images, channels roughly balanced --
+see that doc's root-cause section), unlike real sensor raw, which is genuinely unWB'd.
+To retrain the network on a unified "native, unWB'd raw" input convention, this class
+mosaics a deliberately un-white-balanced version of each crop (dividing R/B by a randomly
+sampled per-sample gain before mosaicking -- G is untouched, gain=1), simulating what this
+same scene would have looked like straight off a real sensor before WB. The *un-divided*
+crop is still returned as-is for the demosaic RGB ground truth: for the clean signal this
+round trip is an exact no-op ((L/gain)*gain == L), so the GT doesn't need touching -- it's
+only the *noisy* path (noise added downstream, in DataAug.transform, between this inv-WB
+and the matching WB-back) that actually differs from a plain mosaic, because noise
+synthesized at the smaller per-channel native magnitude ends up proportionally larger once
+WB'd back, reproducing a real sensor's "channels needing more WB gain end up relatively
+noisier" behavior. The sampled gain is returned alongside the mosaic so
+DataAug.transform can apply the *same* value for its WB-back step (it can't resample
+independently -- see that function's batch_wb_gain parameter).
 """
 from pathlib import Path
 
@@ -79,10 +97,29 @@ class SyntheticMosaicImages(Dataset):
             crop = np.flip(crop, axis=0)
         crop = np.ascontiguousarray(crop)
 
-        rggb01 = RawUtils.rgb_to_mosaic_rggb(crop)
+        # Phase 3 Option 5 (see module docstring): mosaic a deliberately un-white-balanced
+        # version of crop. wb_gain is always returned (identity [1, 1] when
+        # opts.wb_gain_range is None), so DataAug.transform's batch_wb_gain parameter
+        # always receives a real value and the whole round trip collapses to a no-op
+        # exactly reproducing pre-Option-5 behavior when the option is disabled.
+        if self.opts.wb_gain_range is not None:
+            (r_lo, r_hi), (b_lo, b_hi) = self.opts.wb_gain_range
+            r_gain = float(np.random.uniform(r_lo, r_hi))
+            b_gain = float(np.random.uniform(b_lo, b_hi))
+        else:
+            r_gain, b_gain = 1.0, 1.0
+        wb_gain = np.array([r_gain, b_gain], dtype=np.float32)
+
+        crop_native = crop.copy()
+        crop_native[..., 0] /= r_gain
+        crop_native[..., 2] /= b_gain
+
+        rggb01 = RawUtils.rgb_to_mosaic_rggb(crop_native)
         rggb01_chw = np.ascontiguousarray(rggb01.transpose(2, 0, 1)).astype(np.float32)
+        # the demosaic RGB ground truth is the ORIGINAL (not inv-WB'd) crop -- see
+        # module docstring for why this round trip must not touch it
         rgb01_chw = np.ascontiguousarray(crop.transpose(2, 0, 1)).astype(np.float32)
         g_mean_01 = float(crop[..., 1].mean())
-        return rggb01_chw, g_mean_01, rgb01_chw
+        return rggb01_chw, g_mean_01, rgb01_chw, wb_gain
 
 # vim: ts=4 sw=4 sts=4 expandtab
