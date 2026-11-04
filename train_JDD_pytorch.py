@@ -31,6 +31,39 @@ R and B) comfortably cover dataset/benchmark's and dataset/test's real wb_gain v
 the doc). Pass identical lo/hi values (e.g. "--wb-r-gain-range 1.0 1.0 --wb-b-gain-range
 1.0 1.0") to effectively disable this and reproduce the Phase 1/2 unWB'd-native convention
 instead.
+
+--demosaic-ssim-epochs (plan_phase1.md's deferred "loss函数升级" item): an opt-in
+SSIM-then-L1 schedule for the demosaic loss only, inspired by (not identical to)
+../../AIDMSC_research/DMSC_NestUnet's own SSIM-then-MSE schedule (confirmed by reading its
+config.py/train.py -- CHANGE_CRI_EPOCH=10, a hard switch via a loss-sign-flip trick, not a
+blend). Default 0 disables this entirely -- demosaic loss stays pure L1 for every epoch,
+the original, already-validated behavior (epoch_best_13/epoch_best_14/the JDD_WB run all
+used this path). When > 0, epochs < --demosaic-ssim-epochs use (1 - SSIM(pred_rgb, gt_rgb))
+as the demosaic loss instead of L1; epochs >= it switch to plain L1, same as DMSC_NestUnet's
+shape (hard switch, not blended) but using 1-SSIM/L1 rather than SSIM/MSE (keeping L1 as the
+"settle" phase here, since that's this repo's own established choice for every other loss
+term, not MSE).
+
+The denoise branches (loss_real, loss_denoise) are deliberately left as pure L1 always --
+only the demosaic loss is affected by this schedule. Rationale: the denoise weights come
+from an already-validated pretrained checkpoint and have been stable/plateaued across every
+change tried in this project so far (demosaic_weight included); the demosaic branch is the
+one still showing a (slow, noisy) training-loss improvement with no matching visible/metric
+improvement (see epoch_best_14 vs epoch_34 comparison), making it the natural place to try a
+different loss shape rather than more epochs/weight of the same L1 objective.
+
+SSIM requires its inputs in a known, roughly-[0,1] dynamic range (see models/pytorch_ssim.py
+docstring) -- but gt_rgb/pred_rgb here live in a per-sample-ISO-dependent magnitude (same
+cvt_k-driven scale as the RGGB tensors; see dataset/training_pytorch.py::DataAug.transform).
+Reused the same norm_k (== cvt_k) already computed for get_loss_l1 to renormalize both
+tensors (divide by norm_k * inp_scale) back to ~[0,1] before calling SSIM, rather than
+introducing a separate normalization scheme.
+
+epoch_history.csv gained a trailing demosaic_loss_type column ('ssim' or 'l1') recording
+which loss was active that epoch -- 1-SSIM and L1 values are not on the same numeric scale
+(same non-comparability issue already hit once with the demosaic_weight 1.0->2.0 change;
+this column exists so a future epoch_history analysis doesn't have to reconstruct which
+regime produced which row from the launch command alone).
 """
 import argparse
 import json
@@ -48,6 +81,7 @@ from tqdm import tqdm
 from dataset.synthetic_mosaic import SyntheticMosaicImages
 from dataset.training_pytorch import CleanRawImages, DataAug
 from models.net_torch import NetworkDemosaic
+from models.pytorch_ssim import SSIM
 from train_pytorch import add_data_aug_args, build_data_aug_options, get_loss_l1
 
 # Windows priority-class constants (kernel32 SetPriorityClass) -- used by --low-priority
@@ -98,17 +132,18 @@ def save_resume_state(ckp_dir: Path, epoch: int, best_loss: float, best_epoch):
 # per-epoch curve survives any number of interruptions/relaunches, independent of how the
 # process is wrapped.
 EPOCH_HISTORY_FILENAME = 'epoch_history.csv'
-EPOCH_HISTORY_HEADER = 'epoch,mean_loss,mean_real_denoise,mean_synth_denoise,mean_demosaic\n'
+EPOCH_HISTORY_HEADER = 'epoch,mean_loss,mean_real_denoise,mean_synth_denoise,mean_demosaic,demosaic_loss_type\n'
 
 
 def append_epoch_history(ckp_dir: Path, epoch: int, mean_loss: float,
-                          mean_real_denoise: float, mean_synth_denoise: float, mean_demosaic: float):
+                          mean_real_denoise: float, mean_synth_denoise: float, mean_demosaic: float,
+                          demosaic_loss_type: str):
     path = ckp_dir / EPOCH_HISTORY_FILENAME
     write_header = not path.exists()
     with path.open('a') as f:
         if write_header:
             f.write(EPOCH_HISTORY_HEADER)
-        f.write(f'{epoch},{mean_loss},{mean_real_denoise},{mean_synth_denoise},{mean_demosaic}\n')
+        f.write(f'{epoch},{mean_loss},{mean_real_denoise},{mean_synth_denoise},{mean_demosaic},{demosaic_loss_type}\n')
 
 
 def limit_cpu_usage(num_threads: int, low_priority: bool):
@@ -157,7 +192,17 @@ def main():
     parser.add_argument('--init-ckp', type=Path, default=Path('models/torch_pretrained.ckp'),
                          help='denoise-only checkpoint to initialize the shared trunk from')
     parser.add_argument('--demosaic-weight', type=float, default=1.0,
-                         help='weight of the demosaic L1 loss relative to the denoise L1 loss, on synthetic batches')
+                         help='weight of the demosaic loss (L1 or, during --demosaic-ssim-epochs, '
+                              '1-SSIM) relative to the denoise L1 loss, on synthetic batches')
+    parser.add_argument('--demosaic-ssim-epochs', type=int, default=0,
+                         help='use (1 - SSIM) as the demosaic loss for the first N epochs '
+                              '(DMSC_NestUnet-inspired schedule, see module docstring), then '
+                              'switch to plain L1 for the rest. Default 0 disables this -- pure '
+                              'L1 for every epoch, the original behavior. Only affects the '
+                              'demosaic loss; denoise losses stay L1 always.')
+    parser.add_argument('--ssim-window-size', type=int, default=11,
+                         help='Gaussian window size for the SSIM demosaic loss (only used when '
+                              '--demosaic-ssim-epochs > 0); 11 matches DMSC_NestUnet\'s own default')
     parser.add_argument('--wb-r-gain-range', nargs=2, type=float, default=[1.0, 3.0],
                          help='Phase 3 Option 5: random per-sample R-channel WB gain range '
                               'applied to the network\'s raw input (both branches) and clean '
@@ -220,9 +265,23 @@ def main():
     real_loader = DataLoader(real_ds, batch_size=args.batch_size, shuffle=True, drop_last=True)
     synth_loader = DataLoader(synth_ds, batch_size=args.batch_size, shuffle=True, drop_last=True)
 
+    # Only constructed when actually needed -- SSIM's Gaussian window buffer is cheap, but
+    # no reason to build it for a run that never uses it (--demosaic-ssim-epochs 0, the default).
+    ssim_module = SSIM(window_size=args.ssim_window_size).to(device) if args.demosaic_ssim_epochs > 0 else None
+
     global_step = 0
     for epoch in range(start_epoch, args.num_epoch):
+        if args.demosaic_ssim_epochs > 0 and epoch == args.demosaic_ssim_epochs:
+            # The epoch_loss scale is not comparable across the ssim->l1 switch (same issue
+            # as the demosaic_weight 1.0->2.0 change elsewhere in this project) -- reset
+            # best-checkpoint tracking so "best" is only ever compared within one regime.
+            tqdm.write(f"epoch {epoch}: demosaic loss switching ssim -> l1; resetting "
+                       f"best-checkpoint tracking (previous best_loss={best_loss:.4f} was on "
+                       f"a non-comparable 1-SSIM scale)")
+            best_loss, best_epoch = float('inf'), None
         net.train()
+        use_ssim_this_epoch = epoch < args.demosaic_ssim_epochs
+        demosaic_loss_type = 'ssim' if use_ssim_this_epoch else 'l1'
         # synth_loader (e.g. 42 Kodak24/McMaster images) is far smaller than real_loader
         # (e.g. 231 SID_Sony_raw images), so it determines how many steps make up one
         # epoch here; real_loader is cycled to keep supplying batches alongside it.
@@ -245,7 +304,15 @@ def main():
             optimizer.zero_grad()
             pred_rggb, pred_rgb = net(noisy)
             loss_denoise = get_loss_l1(pred_rggb, gt_rggb, norm_k)
-            loss_demosaic = (pred_rgb - gt_rgb).abs().mean()
+            if use_ssim_this_epoch:
+                # Renormalize to ~[0,1] before SSIM -- see models/pytorch_ssim.py docstring;
+                # norm_k here is the same cvt_k already computed for get_loss_l1 above.
+                rgb_scale = norm_k * aug_opts.inp_scale
+                pred_rgb01 = pred_rgb / rgb_scale
+                gt_rgb01 = gt_rgb / rgb_scale
+                loss_demosaic = 1.0 - ssim_module(pred_rgb01, gt_rgb01)
+            else:
+                loss_demosaic = (pred_rgb - gt_rgb).abs().mean()
             loss_synth = loss_denoise + args.demosaic_weight * loss_demosaic
             loss_synth.backward()
             optimizer.step()
@@ -257,18 +324,24 @@ def main():
             if global_step % args.log_every == 0:
                 tqdm.write(
                     f"epoch {epoch} step {global_step}: real_denoise={loss_real.item():.4f} "
-                    f"synth_denoise={loss_denoise.item():.4f} demosaic={loss_demosaic.item():.4f}"
+                    f"synth_denoise={loss_denoise.item():.4f} "
+                    f"demosaic[{demosaic_loss_type}]={loss_demosaic.item():.4f}"
                 )
             global_step += 1
 
         # Per-step loss is noisy (same reasoning as train_qat_pytorch.py) -- the epoch
         # mean below is what should actually be watched and is what "best checkpoint"
         # is defined against, since there's no held-out validation split here either.
+        # NOTE: epoch_loss/mean_demosaic are only comparable across epochs using the SAME
+        # demosaic_loss_type -- see epoch_history.csv's demosaic_loss_type column and this
+        # file's module docstring (same non-comparability issue already seen once with the
+        # demosaic_weight 1.0->2.0 change).
         epoch_loss = float(np.mean(epoch_losses))
-        tqdm.write(f"epoch {epoch} mean loss: {epoch_loss:.4f}")
+        tqdm.write(f"epoch {epoch} mean loss: {epoch_loss:.4f} (demosaic_loss_type={demosaic_loss_type})")
         append_epoch_history(
             args.ckp_dir, epoch, epoch_loss,
             float(np.mean(epoch_real_denoise)), float(np.mean(epoch_synth_denoise)), float(np.mean(epoch_demosaic)),
+            demosaic_loss_type,
         )
 
         save_regular = (epoch % args.save_every == 0)
